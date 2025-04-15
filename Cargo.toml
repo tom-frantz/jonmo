@@ -11,3 +11,4 @@ repository = "https://github.com/databasedav/jonmo"
 documentation = "https://docs.rs/jonmo"
 
 [dependencies]
+bevy = "0.15.3"
