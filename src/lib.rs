@@ -71,8 +71,15 @@
 //! }
 //! ```
 
-use std::{collections::{HashMap, HashSet}, marker::PhantomData, sync::Arc};
-use bevy::{ecs::system::SystemId, prelude::*, reflect::{GetTypeRegistration, PartialReflect, Typed}};
+use bevy_app::prelude::*;
+use bevy_ecs::{prelude::*, system::SystemId};
+use bevy_log::prelude::*;
+use bevy_reflect::{GetTypeRegistration, Typed, prelude::*};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::Arc,
+};
 
 /// Creates a simple signal source system that always outputs the given `entity`.
 /// Useful as a starting point for signals related to a specific entity.
@@ -142,10 +149,7 @@ pub const TERMINATE: Option<()> = None;
 /// let result4 = system.run(MyValue(20), &mut world);
 /// assert_eq!(result4, None);
 /// ```
-pub fn dedupe<T>(
-    In(current): In<T>,
-    mut cache: Local<Option<T>>,
-) -> Option<T>
+pub fn dedupe<T>(In(current): In<T>, mut cache: Local<Option<T>>) -> Option<T>
 where
     T: PartialEq + Clone + Send + Sync + 'static + std::fmt::Debug,
 {
@@ -194,18 +198,21 @@ where
             run: Arc::new(Box::new(move |world, input| {
                 let system_id = SystemId::<In<I>, Option<O>>::from_entity(system_entity);
                 match I::from_reflect(input.as_ref()) {
-                    Some(typed_input) => {
-                        world.run_system_with_input(system_id, typed_input)
-                            .ok()
-                            .flatten()
-                            .map(|val| Box::new(val) as Box<dyn PartialReflect>)
-                    },
+                    Some(typed_input) => world
+                        .run_system_with_input(system_id, typed_input)
+                        .ok()
+                        .flatten()
+                        .map(|val| Box::new(val) as Box<dyn PartialReflect>),
                     None => {
-                        warn!("failed to downcast input for system {:?}: {:?}", system_entity, input.reflect_type_path());
+                        warn!(
+                            "failed to downcast input for system {:?}: {:?}",
+                            system_entity,
+                            input.reflect_type_path()
+                        );
                         None
                     }
                 }
-            }))
+            })),
         });
     }
     system_id
@@ -215,10 +222,13 @@ where
 ///
 /// Root systems are the starting points for signal propagation during the `Update` phase.
 pub fn mark_signal_root(world: &mut World, system_entity: UntypedSystemId) {
-     if let Some(mut propagator) = world.get_resource_mut::<SignalPropagator>() {
+    if let Some(mut propagator) = world.get_resource_mut::<SignalPropagator>() {
         propagator.add_root(system_entity);
     } else {
-        warn!("SignalPropagator resource not found while registering root {:?}", system_entity);
+        warn!(
+            "SignalPropagator resource not found while registering root {:?}",
+            system_entity
+        );
     }
 }
 
@@ -230,7 +240,10 @@ pub fn pipe_signal(world: &mut World, source: UntypedSystemId, target: UntypedSy
     if let Some(mut propagator) = world.get_resource_mut::<SignalPropagator>() {
         propagator.add_child(source, target);
     } else {
-        warn!("SignalPropagator resource not found while piping {:?} -> {:?}", source, target);
+        warn!(
+            "SignalPropagator resource not found while piping {:?} -> {:?}",
+            source, target
+        );
     }
 }
 
@@ -253,19 +266,21 @@ where
 {
     let left_wrapper_id = register_signal::<OLeft, (Option<OLeft>, Option<ORight>), _>(
         world,
-        |In(left_val): In<OLeft>| Some((Some(left_val), None::<ORight>))
+        |In(left_val): In<OLeft>| Some((Some(left_val), None::<ORight>)),
     );
     pipe_signal(world, left, left_wrapper_id.entity());
 
     let right_wrapper_id = register_signal::<ORight, (Option<OLeft>, Option<ORight>), _>(
         world,
-        |In(right_val): In<ORight>| Some((None::<OLeft>, Some(right_val)))
+        |In(right_val): In<ORight>| Some((None::<OLeft>, Some(right_val))),
     );
     pipe_signal(world, right, right_wrapper_id.entity());
 
     let combine_id = register_signal(
         world,
-        move |In((left_opt, right_opt)): In<(Option<OLeft>, Option<ORight>)>, mut left_cache: Local<Option<OLeft>>, mut right_cache: Local<Option<ORight>>| {
+        move |In((left_opt, right_opt)): In<(Option<OLeft>, Option<ORight>)>,
+              mut left_cache: Local<Option<OLeft>>,
+              mut right_cache: Local<Option<ORight>>| {
             if left_opt.is_some() {
                 *left_cache = left_opt;
             }
@@ -277,7 +292,7 @@ where
             } else {
                 None
             }
-        }
+        },
     );
 
     pipe_signal(world, left_wrapper_id.entity(), combine_id.entity());
@@ -294,7 +309,13 @@ where
 #[derive(Component, Clone)]
 pub(crate) struct SystemRunner {
     /// The type-erased function to execute the system.
-    pub(crate) run: Arc<Box<dyn Fn(&mut World, Box<dyn PartialReflect>) -> Option<Box<dyn PartialReflect>> + Send + Sync>>,
+    pub(crate) run: Arc<
+        Box<
+            dyn Fn(&mut World, Box<dyn PartialReflect>) -> Option<Box<dyn PartialReflect>>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl SystemRunner {
@@ -302,7 +323,11 @@ impl SystemRunner {
     ///
     /// Takes the `World` and a `Box<dyn PartialReflect>` input, runs the system,
     /// and returns an optional `Box<dyn PartialReflect>` output.
-    pub(crate) fn run(&self, world: &mut World, input: Box<dyn PartialReflect>) -> Option<Box<dyn PartialReflect>> {
+    pub(crate) fn run(
+        &self,
+        world: &mut World,
+        input: Box<dyn PartialReflect>,
+    ) -> Option<Box<dyn PartialReflect>> {
         (self.run)(world, input)
     }
 }
@@ -320,7 +345,7 @@ pub(crate) struct SignalPropagator {
     roots: HashSet<Entity>,
 }
 
-impl SignalPropagator {    
+impl SignalPropagator {
     /// Adds a system entity as a root node, ensuring it's also present in the `nodes` map.
     /// Avoids adding duplicates to the `roots` set.
     pub(crate) fn add_root(&mut self, entity: Entity) -> Entity {
@@ -330,32 +355,32 @@ impl SignalPropagator {
         }
         entity
     }
-    
+
     /// Adds a child system entity to a parent system entity in the graph.
     /// Ensures both nodes exist in the `nodes` map and initializes the child set if needed.
     /// Avoids adding duplicate children.
     pub(crate) fn add_child(&mut self, parent_entity: Entity, child_entity: Entity) -> Entity {
         self.add_node(parent_entity);
         self.add_node(child_entity);
-        
+
         let children = self.nodes.entry(parent_entity).or_insert(None);
         if children.is_none() {
             *children = Some(HashSet::new());
         }
-        
+
         if let Some(set) = children {
             set.insert(child_entity);
         }
-        
+
         child_entity
     }
-    
+
     /// Ensures a node exists in the `nodes` map, initializing its children to `None` if new.
     fn add_node(&mut self, entity: Entity) -> Entity {
         self.nodes.entry(entity).or_insert(None);
         entity
     }
-    
+
     /// Recursively removes a node and its downstream connections from the graph.
     ///
     /// It despawns the corresponding entity from the `World`. If a child node has other
@@ -387,7 +412,9 @@ impl SignalPropagator {
             }
         }
 
-        let parents: Vec<Entity> = self.nodes.iter()
+        let parents: Vec<Entity> = self
+            .nodes
+            .iter()
             .filter_map(|(parent, children_opt)| {
                 if let Some(children) = children_opt {
                     if children.contains(&entity) {
@@ -414,10 +441,13 @@ impl SignalPropagator {
             info!("Despawning signal system entity {:?}", entity);
             entity_commands.despawn();
         } else {
-            warn!("Attempted to despawn entity {:?} during signal cleanup, but it was already gone.", entity);
+            warn!(
+                "Attempted to despawn entity {:?} during signal cleanup, but it was already gone.",
+                entity
+            );
         }
     }
-    
+
     /// Executes all registered signal chains starting from the root nodes for the current frame.
     ///
     /// Iterates through the `roots`, runs their corresponding systems via [`SystemRunner`],
@@ -425,7 +455,12 @@ impl SignalPropagator {
     /// to propagate the output down the graph. This happens once per frame via the `process_signals` system.
     pub(crate) fn execute(&self, world: &mut World) {
         for &root_entity in &self.roots {
-            if let Some(runner) = world.get_entity(root_entity).ok().and_then(|e| e.get::<SystemRunner>()).cloned() {
+            if let Some(runner) = world
+                .get_entity(root_entity)
+                .ok()
+                .and_then(|e| e.get::<SystemRunner>())
+                .cloned()
+            {
                 // Run the root system (input is always () for roots)
                 if let Some(output) = runner.run(world, Box::new(())) {
                     // If the root produced output, start propagating to its children
@@ -433,7 +468,10 @@ impl SignalPropagator {
                 }
                 // If runner.run returned None, propagation stops here for this root this frame.
             } else {
-                warn!("SystemRunner component not found for root entity {:?}", root_entity);
+                warn!(
+                    "SystemRunner component not found for root entity {:?}",
+                    root_entity
+                );
             }
         }
     }
@@ -444,10 +482,20 @@ impl SignalPropagator {
     /// from the parent. If the child system produces `Some(output)`, it recursively calls itself
     /// for the child's children, continuing the propagation. If the child system returns `None`,
     /// the propagation stops along this branch for this frame.
-    fn process_children(&self, parent_entity: Entity, world: &mut World, input: Box<dyn PartialReflect>) {
+    fn process_children(
+        &self,
+        parent_entity: Entity,
+        world: &mut World,
+        input: Box<dyn PartialReflect>,
+    ) {
         if let Some(Some(children)) = self.nodes.get(&parent_entity) {
             for &child_entity in children {
-                if let Some(runner) = world.get_entity(child_entity).ok().and_then(|e| e.get::<SystemRunner>()).cloned() {
+                if let Some(runner) = world
+                    .get_entity(child_entity)
+                    .ok()
+                    .and_then(|e| e.get::<SystemRunner>())
+                    .cloned()
+                {
                     // Run the child system with the input from the parent
                     if let Some(output) = runner.run(world, input.clone_value()) {
                         // If the child produced output, continue propagation to its children
@@ -455,7 +503,10 @@ impl SignalPropagator {
                     }
                     // If runner.run returned None, propagation stops here for this child this frame.
                 } else {
-                    warn!("SystemRunner component not found for child entity {:?}", child_entity);
+                    warn!(
+                        "SystemRunner component not found for child entity {:?}",
+                        child_entity
+                    );
                 }
             }
         }
@@ -519,7 +570,11 @@ where
 /// Contains references to the two parent nodes and the function to register the combining systems.
 pub(crate) struct CombineSignal<F>
 where
-    F: Fn(&mut World, UntypedSystemId, UntypedSystemId) -> UntypedSystemId + Send + Sync + 'static + ?Sized,
+    F: Fn(&mut World, UntypedSystemId, UntypedSystemId) -> UntypedSystemId
+        + Send
+        + Sync
+        + 'static
+        + ?Sized,
 {
     /// The left parent node in the signal chain definition.
     pub(crate) left_signal: Arc<dyn ISignal>,
@@ -531,7 +586,11 @@ where
 
 impl<F> ISignal for CombineSignal<F>
 where
-    F: Fn(&mut World, UntypedSystemId, UntypedSystemId) -> UntypedSystemId + Send + Sync + 'static + ?Sized,
+    F: Fn(&mut World, UntypedSystemId, UntypedSystemId) -> UntypedSystemId
+        + Send
+        + Sync
+        + 'static
+        + ?Sized,
 {
     /// Recursively registers both parent nodes, then executes the stored `register_fn`
     /// to register the necessary combining/wrapper systems and connect them.
@@ -591,9 +650,15 @@ impl SignalHandle {
             propagator.remove_node(world, self.0);
             world.insert_resource(propagator);
         } else {
-            warn!("SignalPropagator not found during cleanup for system {:?}", self.0);
+            warn!(
+                "SignalPropagator not found during cleanup for system {:?}",
+                self.0
+            );
             if let Ok(entity_commands) = world.get_entity_mut(self.0) {
-                warn!("Despawning entity {:?} directly as SignalPropagator was missing.", self.0);
+                warn!(
+                    "Despawning entity {:?} directly as SignalPropagator was missing.",
+                    self.0
+                );
                 entity_commands.despawn();
             }
         }
@@ -733,12 +798,8 @@ impl Signal<(), ()> {
     where
         C: Component + FromReflect + Clone + Send + Sync + 'static,
     {
-        let component_query_system = move |
-            _: In<()>,
-            query: Query<&'static C, Changed<C>>
-        | {
-            query.get(entity).ok().cloned()
-        };
+        let component_query_system =
+            move |_: In<()>, query: Query<&'static C, Changed<C>>| query.get(entity).ok().cloned();
         Self::from_system(component_query_system)
     }
 
@@ -769,10 +830,7 @@ impl Signal<(), ()> {
     where
         R: Resource + FromReflect + Clone + Send + Sync + 'static,
     {
-        let resource_query_system = move |
-             _: In<()>,
-             res: Res<R>
-        | {
+        let resource_query_system = move |_: In<()>, res: Res<R>| {
             if res.is_changed() {
                 Some(res.clone())
             } else {
@@ -834,13 +892,11 @@ where
     where
         U: FromReflect + Send + Sync + 'static,
     {
-        let register_fn = Arc::new(
-            move |world: &mut World, prev_id_entity: UntypedSystemId| {
-                let new_system_id = register_signal(world, system.clone());
-                pipe_signal(world, prev_id_entity, new_system_id.entity());
-                new_system_id.entity()
-            }
-        );
+        let register_fn = Arc::new(move |world: &mut World, prev_id_entity: UntypedSystemId| {
+            let new_system_id = register_signal(world, system.clone());
+            pipe_signal(world, prev_id_entity, new_system_id.entity());
+            new_system_id.entity()
+        });
 
         let map_signal = MapSignal {
             prev_signal: self.signal_impl.clone(),
@@ -901,16 +957,22 @@ where
     /// // world.init_resource::<SourceB>();
     /// // let handle = combined_signal.register(&mut world);
     /// ```
-    pub fn combine_with<I2, O2>(
-        self,
-        other: Signal<I2, O2>,
-    ) -> Signal<(), (O, O2)>
+    pub fn combine_with<I2, O2>(self, other: Signal<I2, O2>) -> Signal<(), (O, O2)>
     where
         I2: Send + Sync + 'static,
-        O2: FromReflect + GetTypeRegistration + Typed + Send + Sync + Clone + 'static + std::fmt::Debug,
+        O2: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + Clone
+            + 'static
+            + std::fmt::Debug,
     {
         let register_fn = Arc::new(
-            move |world: &mut World, left_id_entity: UntypedSystemId, right_id_entity: UntypedSystemId| {
+            move |world: &mut World,
+                  left_id_entity: UntypedSystemId,
+                  right_id_entity: UntypedSystemId| {
                 let combined_id = combine_signal::<O, O2>(world, left_id_entity, right_id_entity);
                 combined_id.entity()
             },
@@ -1004,10 +1066,9 @@ pub struct JonmoPlugin;
 impl Plugin for JonmoPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Update, process_signals)
-           .init_resource::<SignalPropagator>();
+            .init_resource::<SignalPropagator>();
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1076,7 +1137,6 @@ mod tests {
         }
     }
 
-
     // --- Test Setup ---
 
     fn setup_app() -> App {
@@ -1120,11 +1180,12 @@ mod tests {
 
         let entity = app.world.spawn(TestValue(5)).id();
 
-        let signal = Signal::from_component::<TestValue>(entity)
-            .map(|In(v): In<TestValue>, res: Res<TestResult<i32>>| {
+        let signal = Signal::from_component::<TestValue>(entity).map(
+            |In(v): In<TestValue>, res: Res<TestResult<i32>>| {
                 res.set(v.0);
                 TERMINATE
-            });
+            },
+        );
 
         let _handle = signal.register(&mut app.world);
 
@@ -1133,7 +1194,11 @@ mod tests {
         assert_eq!(result_store.lock().unwrap().take(), None);
 
         // Modify the component
-        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 15;
+        app.world
+            .entity_mut(entity)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 15;
 
         // Run again - change should be detected
         app.update();
@@ -1151,11 +1216,12 @@ mod tests {
         app.insert_resource(TestResult(result_store.clone()));
         app.init_resource::<TestResource>();
 
-        let signal = Signal::from_resource::<TestResource>()
-            .map(|In(v): In<TestResource>, res: Res<TestResult<String>>| {
+        let signal = Signal::from_resource::<TestResource>().map(
+            |In(v): In<TestResource>, res: Res<TestResult<String>>| {
                 res.set(v.0);
                 TERMINATE
-            });
+            },
+        );
 
         let _handle = signal.register(&mut app.world);
 
@@ -1168,7 +1234,10 @@ mod tests {
 
         // Run again - change should be detected
         app.update();
-        assert_eq!(result_store.lock().unwrap().take(), Some("hello".to_string()));
+        assert_eq!(
+            result_store.lock().unwrap().take(),
+            Some("hello".to_string())
+        );
 
         // Run again - no change
         app.update();
@@ -1193,7 +1262,11 @@ mod tests {
         let _handle = signal.register(&mut app.world);
 
         // Initial change
-        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 10;
+        app.world
+            .entity_mut(entity)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 10;
         app.update();
         assert_eq!(result_store.lock().unwrap().clone(), vec![10]);
 
@@ -1202,12 +1275,20 @@ mod tests {
         assert_eq!(result_store.lock().unwrap().clone(), vec![10]); // Should not run again
 
         // Change again
-        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 20;
+        app.world
+            .entity_mut(entity)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 20;
         app.update();
         assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20]);
 
         // Change back
-        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 10;
+        app.world
+            .entity_mut(entity)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 10;
         app.update();
         assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20, 10]);
 
@@ -1215,7 +1296,6 @@ mod tests {
         app.update();
         assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20, 10]); // Should not run again
     }
-
 
     #[test]
     fn test_combine_with() {
@@ -1229,12 +1309,12 @@ mod tests {
         let signal_a = Signal::from_component::<TestValue>(entity_a).map(dedupe);
         let signal_b = Signal::from_resource::<TestResource>().map(dedupe);
 
-        let combined = signal_a
-            .combine_with(signal_b)
-            .map(|In((a, b)): In<(TestValue, TestResource)>, res: Res<TestResult<(i32, String)>>| {
+        let combined = signal_a.combine_with(signal_b).map(
+            |In((a, b)): In<(TestValue, TestResource)>, res: Res<TestResult<(i32, String)>>| {
                 res.set((a.0, b.0));
                 TERMINATE
-            });
+            },
+        );
 
         let _handle = combined.register(&mut app.world);
 
@@ -1243,7 +1323,11 @@ mod tests {
         assert_eq!(result_store.lock().unwrap().take(), None);
 
         // 2. Change A
-        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 1;
+        app.world
+            .entity_mut(entity_a)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 1;
         app.update();
         assert_eq!(result_store.lock().unwrap().take(), None); // B hasn't fired yet
 
@@ -1251,7 +1335,10 @@ mod tests {
         app.world.resource_mut::<TestResource>().0 = "first".to_string();
         app.update();
         // Now both have fired, combine should trigger with (1, "first")
-        assert_eq!(result_store.lock().unwrap().take(), Some((1, "first".to_string())));
+        assert_eq!(
+            result_store.lock().unwrap().take(),
+            Some((1, "first".to_string()))
+        );
 
         // 4. Change B again
         app.world.resource_mut::<TestResource>().0 = "second".to_string();
@@ -1259,22 +1346,39 @@ mod tests {
         assert_eq!(result_store.lock().unwrap().take(), None); // A hasn't fired again yet
 
         // 5. Change A again
-        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 2;
+        app.world
+            .entity_mut(entity_a)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 2;
         app.update();
         // Combine should trigger with (2, "second") - uses latest B
-        assert_eq!(result_store.lock().unwrap().take(), Some((2, "second".to_string())));
+        assert_eq!(
+            result_store.lock().unwrap().take(),
+            Some((2, "second".to_string()))
+        );
 
         // 6. Change A multiple times, then B
-        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 3;
+        app.world
+            .entity_mut(entity_a)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 3;
         app.update();
-        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 4;
+        app.world
+            .entity_mut(entity_a)
+            .get_mut::<TestValue>()
+            .unwrap()
+            .0 = 4;
         app.update();
         app.world.resource_mut::<TestResource>().0 = "third".to_string();
         app.update();
         // Combine should trigger with latest A (4) and latest B ("third")
-        assert_eq!(result_store.lock().unwrap().take(), Some((4, "third".to_string())));
+        assert_eq!(
+            result_store.lock().unwrap().take(),
+            Some((4, "third".to_string()))
+        );
     }
-
 
     #[test]
     fn test_cleanup() {
@@ -1282,8 +1386,8 @@ mod tests {
         let result_store = Arc::new(Mutex::new(0)); // Count how many times the last system runs
         app.insert_resource(TestCounterResult(result_store.clone()));
 
-        let signal = Signal::from_system(|| Some(1))
-            .map(|In(v): In<i32>, res: Res<TestCounterResult>| {
+        let signal =
+            Signal::from_system(|| Some(1)).map(|In(v): In<i32>, res: Res<TestCounterResult>| {
                 res.increment(v);
                 Some(v) // Pass through
             });

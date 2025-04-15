@@ -1,5 +1,5 @@
-use jonmo::*;
 use bevy::prelude::*;
+use jonmo::*;
 
 fn main() {
     let mut app = App::new();
@@ -35,7 +35,8 @@ fn setup_ui(world: &mut World) {
 
     // 1. Define the signal chain using the builder pattern.
     let signal_chain = Signal::from_component::<Value>(entity) // Start signal from Value component changes on 'entity'
-        .map(move |In(value): In<Value>, mut commands: Commands| { // Map the changed Value to a system that updates text
+        .map(move |In(value): In<Value>, mut commands: Commands| {
+            // Map the changed Value to a system that updates text
             // Update text by inserting the Text component
             commands.entity(text).insert(Text(value.0.to_string()));
             TERMINATE // Signal propagation stops after this system runs.

@@ -1,6 +1,6 @@
 [package]
 name = "jonmo"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 categories = ["asynchronous", "gui", "game-development"]
 description = "Bevy-native reactive signals"
@@ -11,4 +11,10 @@ repository = "https://github.com/databasedav/jonmo"
 documentation = "https://docs.rs/jonmo"
 
 [dependencies]
+bevy_ecs = "0.15.3"
+bevy_reflect = "0.15.3"
+bevy_log = "0.15.3"
+bevy_app = "0.15.3"
+
+[dev-dependencies]
 bevy = "0.15.3"

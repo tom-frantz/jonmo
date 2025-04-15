@@ -106,6 +106,7 @@ See the [imperative example](https://github.com/databasedav/jonmo/blob/main/exam
 
 |bevy|jonmo|
 |-|-|
+|0.15|0.1|
 
 ## license
 All code in this repository is dual-licensed under either:

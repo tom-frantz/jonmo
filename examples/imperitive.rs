@@ -1,5 +1,5 @@
-use jonmo::*;
 use bevy::prelude::*;
+use jonmo::*;
 
 fn main() {
     let mut app = App::new();
@@ -46,9 +46,12 @@ fn setup_ui(world: &mut World) {
     // It queries for the `Value` component on that entity, but only if it has changed (`Changed<Value>`).
     // If the component exists and has changed, it returns `Some(cloned_value)`. Otherwise, `None`.
     // `register_signal` registers this system.
-    let system2_id = register_signal(world, |In(entity): In<Entity>, values: Query<&Value, Changed<Value>>| {
-        values.get(entity).ok().cloned()
-    });
+    let system2_id = register_signal(
+        world,
+        |In(entity): In<Entity>, values: Query<&Value, Changed<Value>>| {
+            values.get(entity).ok().cloned()
+        },
+    );
     // `pipe_signal` connects the output of system1 (the Entity ID) to the input of system2.
     pipe_signal(world, system1_id.entity(), system2_id.entity());
 
@@ -58,11 +61,14 @@ fn setup_ui(world: &mut World) {
     // `move` is used to capture the `text` entity ID.
     // It returns `TERMINATE` (which is `None::<()>`) to stop the signal chain here.
     // `register_signal` registers this system.
-    let system3_id = register_signal(world, move |In(value): In<Value>, mut commands: Commands| {
-        // Update text by inserting the Text component
-        commands.entity(text).insert(Text(value.0.to_string()));
-        TERMINATE // Signal propagation stops after this system runs.
-    });
+    let system3_id = register_signal(
+        world,
+        move |In(value): In<Value>, mut commands: Commands| {
+            // Update text by inserting the Text component
+            commands.entity(text).insert(Text(value.0.to_string()));
+            TERMINATE // Signal propagation stops after this system runs.
+        },
+    );
     // `pipe_signal` connects the output of system2 (the changed Value) to the input of system3.
     pipe_signal(world, system2_id.entity(), system3_id.entity());
 }

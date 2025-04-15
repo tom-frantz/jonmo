@@ -53,73 +53,103 @@ fn setup_ui(mut commands: Commands) {
     // --- Spawn UI Tree ---
     let mut counter_text_entity = Entity::PLACEHOLDER; // Placeholder
 
-    commands.spawn(NodeBundle { // Root node
-        style: Style {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::Center,
-            column_gap: Val::Px(15.0),
+    commands
+        .spawn(NodeBundle {
+            // Root node
+            style: Style {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                column_gap: Val::Px(15.0),
+                ..default()
+            },
             ..default()
-        },
-        ..default()
-    }).with_children(|parent| {
-        // "-" Button
-        parent.spawn((
-            ButtonBundle {
-                style: Style {
-                    width: Val::Px(45.0),
-                    height: Val::Px(45.0),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                background_color: NORMAL_BUTTON.into(),
-                ..default()
-            },
-            CounterButton { step: -1 },
-        )).with_children(|parent| {
-            parent.spawn(TextBundle::from_section("-", TextStyle { font_size: 25.0, ..default() }));
-        });
+        })
+        .with_children(|parent| {
+            // "-" Button
+            parent
+                .spawn((
+                    ButtonBundle {
+                        style: Style {
+                            width: Val::Px(45.0),
+                            height: Val::Px(45.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        background_color: NORMAL_BUTTON.into(),
+                        ..default()
+                    },
+                    CounterButton { step: -1 },
+                ))
+                .with_children(|parent| {
+                    parent.spawn(TextBundle::from_section(
+                        "-",
+                        TextStyle {
+                            font_size: 25.0,
+                            ..default()
+                        },
+                    ));
+                });
 
-        // Counter Display Text
-        counter_text_entity = parent.spawn((
-            TextBundle::from_section("0", TextStyle { font_size: 25.0, ..default() }),
-            CounterText, // Mark this text entity
-        )).id();
+            // Counter Display Text
+            counter_text_entity = parent
+                .spawn((
+                    TextBundle::from_section(
+                        "0",
+                        TextStyle {
+                            font_size: 25.0,
+                            ..default()
+                        },
+                    ),
+                    CounterText, // Mark this text entity
+                ))
+                .id();
 
-        // "+" Button
-        parent.spawn((
-            ButtonBundle {
-                style: Style {
-                    width: Val::Px(45.0),
-                    height: Val::Px(45.0),
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                background_color: NORMAL_BUTTON.into(),
-                ..default()
-            },
-            CounterButton { step: 1 },
-        )).with_children(|parent| {
-            parent.spawn(TextBundle::from_section("+", TextStyle { font_size: 25.0, ..default() }));
+            // "+" Button
+            parent
+                .spawn((
+                    ButtonBundle {
+                        style: Style {
+                            width: Val::Px(45.0),
+                            height: Val::Px(45.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        background_color: NORMAL_BUTTON.into(),
+                        ..default()
+                    },
+                    CounterButton { step: 1 },
+                ))
+                .with_children(|parent| {
+                    parent.spawn(TextBundle::from_section(
+                        "+",
+                        TextStyle {
+                            font_size: 25.0,
+                            ..default()
+                        },
+                    ));
+                });
         });
-    });
 
     // --- Register Signals using Commands::add ---
     commands.add(move |world: &mut World| {
         // Signal chain to update the counter text display
         let update_text_signal = Signal::from_component::<Counter>(counter_entity)
             .map(dedupe) // Only update if the counter value actually changes
-            .map(move |In(counter): In<Counter>, mut text_query: Query<&mut Text, With<CounterText>>| {
-                if let Ok(mut text) = text_query.get_mut(counter_text_entity) {
-                    // Update the text section
-                    text.sections[0].value = counter.0.to_string();
-                    println!("Counter Text Updated: {}", counter.0);
-                }
-                TERMINATE // End the chain here
-            });
+            .map(
+                move |In(counter): In<Counter>,
+                      mut text_query: Query<&mut Text, With<CounterText>>| {
+                    if let Ok(mut text) = text_query.get_mut(counter_text_entity) {
+                        // Update the text section
+                        text.sections[0].value = counter.0.to_string();
+                        println!("Counter Text Updated: {}", counter.0);
+                    }
+                    TERMINATE // End the chain here
+                },
+            );
 
         // Register the signal chain
         let _handle = update_text_signal.register(world);
@@ -158,7 +188,7 @@ fn button_interactions(
             }
         }
     } else {
-         // Handle case where Counter entity doesn't exist or isn't unique if needed
-         // warn!("Could not find unique Counter entity");
+        // Handle case where Counter entity doesn't exist or isn't unique if needed
+        // warn!("Could not find unique Counter entity");
     }
 }
