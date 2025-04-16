@@ -6,23 +6,26 @@
 //! or specific entities) and can be transformed (`map`), combined (`combine_with`), or
 //! deduplicated (`dedupe`).
 //!
-//! The core building block is the [`Signal`] struct, which represents a potential flow of data.
-//! Chains are constructed starting with methods like [`Signal::from_component`] or
-//! [`Signal::from_resource`], followed by combinators like [`Signal::map`] or
-//! [`Signal::combine_with`].
+//! The core building block is the [`Signal`] trait, representing a value that changes over time.
+//! Chains are constructed starting with methods like [`SignalBuilder::from_component`] or
+//! [`SignalBuilder::from_resource`], followed by combinators like [`SignalExt::map`] or
+//! [`SignalExt::combine_with`]. Signal chains must implement `Clone` to be used with combinators
+//! like `combine_with` or to be cloned into closures.
 //!
-//! Finally, a signal chain is activated by calling [`Signal::register`], which registers
+//! Finally, a signal chain is activated by calling [`SignalExt::register`], which registers
 //! the necessary Bevy systems and returns a [`SignalHandle`] for potential cleanup.
+//! Cleaning up a handle removes *all* systems created by that specific `register` call
+//! by decrementing reference counts. If systems were shared with other signal chains, cleaning up
+//! one handle will only remove those shared systems if their reference count reaches zero.
 //!
 //! ## Execution Model
 //!
 //! Internally, jonmo builds and maintains a dependency graph of Bevy systems. Each frame,
-//! the [`JonmoPlugin`] traverses this graph starting from the root systems (created via
-//! `Signal::from_*` methods or marked explicitly with `mark_signal_root`). It pipes the
-//! output (`Some(O)`) of a parent system as the input (`In<O>`) to its children. This
-//! traversal continues down each branch until a system returns `None` (often represented
-//! by the [`TERMINATE`] constant), which halts propagation along that specific path for
-//! the current frame.
+//! the [`JonmoPlugin`] triggers the execution of this graph starting from the root systems
+//! (created via `SignalBuilder::from_*` methods). It pipes the output (`Some(O)`) of a parent
+//! system as the input (`In<O>`) to its children using type-erased runners. This traversal
+//! continues down each branch until a system returns `None` (often represented by the
+//! [`TERMINATE`] constant), which halts propagation along that specific path for the current frame.
 //!
 //! The signal propagation is managed internally by the [`JonmoPlugin`] which should be added
 //! to your Bevy `App`.
@@ -31,7 +34,7 @@
 //!
 //! ```no_run
 //! use bevy::prelude::*;
-//! use jonmo::*;
+//! use jonmo::prelude::*; // Import prelude for common items
 //!
 //! #[derive(Component, Reflect, Clone, Default, PartialEq)]
 //! #[reflect(Component)]
@@ -41,16 +44,17 @@
 //! struct UiEntities { main: Entity, text: Entity }
 //!
 //! fn setup_ui_declarative(world: &mut World) {
+//!     // Assume ui_entities resource is populated
 //!     let ui_entities = world.get_resource::<UiEntities>().unwrap();
 //!     let entity = ui_entities.main;
 //!     let text = ui_entities.text;
 //!
 //!     let text_node = text.clone(); // Clone for closure
-//!     let signal_chain = Signal::from_component::<Value>(entity) // Start from Value component changes
+//!     let signal_chain = SignalBuilder::from_component::<Value>(entity) // Start from Value component changes
 //!         .map(dedupe) // Only propagate if the value is different from the last
 //!         .map(move |In(value): In<Value>, mut cmd: Commands| { // Update text when value changes
 //!             println!("Updating text with Value: {}", value.0);
-//!             cmd.entity(text_node).insert(Text(value.0.to_string()));
+//!             cmd.entity(text_node).insert(Text::from_section(value.0.to_string(), Default::default())); // Assuming Text setup
 //!             TERMINATE // Signal ends here for this frame's execution path.
 //!         });
 //!
@@ -78,8 +82,38 @@ use bevy_reflect::{GetTypeRegistration, Typed, prelude::*};
 use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+// --- Type Aliases for Boxed Registration Functions ---
+
+/// Type alias for the boxed source registration function.
+type SourceRegisterFn<O> =
+    dyn Fn(&mut World) -> SystemId<In<()>, Option<O>> + Send + Sync + 'static;
+
+/// Type alias for the boxed combine registration function.
+type CombineRegisterFn<O1, O2> = dyn Fn(
+        &mut World,
+        UntypedSystemId,
+        UntypedSystemId,
+    ) -> (
+        SystemId<In<(Option<O1>, Option<O2>)>, Option<(O1, O2)>>,
+        Vec<UntypedSystemId>,
+    ) + Send
+    + Sync
+    + 'static;
+
+/// Type alias for the boxed map registration function.
+type MapRegisterFn = dyn Fn(
+        &mut World,
+        UntypedSystemId, // Previous system's entity ID
+    ) -> UntypedSystemId // Registered map system's entity ID
+    + Send
+    + Sync
+    + 'static;
 
 /// Creates a simple signal source system that always outputs the given `entity`.
 /// Useful as a starting point for signals related to a specific entity.
@@ -116,7 +150,7 @@ pub fn entity_root(entity: Entity) -> impl Fn(In<()>) -> Option<Entity> + Clone 
 /// ```
 pub const TERMINATE: Option<()> = None;
 
-/// A system that can be used with [`Signal::map`] to prevent propagation
+/// A system that can be used with [`SignalExt::map`] to prevent propagation
 /// if the incoming value is the same as the previous one.
 ///
 /// Requires the value type `T` to implement `PartialEq`, `Clone`, `Send`, `Sync`, and `'static`.
@@ -126,7 +160,7 @@ pub const TERMINATE: Option<()> = None;
 /// use bevy::prelude::*;
 /// use jonmo::dedupe;
 ///
-/// #[derive(Clone, PartialEq, Debug)]
+/// #[derive(Clone, PartialEq)]
 /// struct MyValue(i32);
 ///
 /// let mut world = World::new();
@@ -151,26 +185,21 @@ pub const TERMINATE: Option<()> = None;
 /// ```
 pub fn dedupe<T>(In(current): In<T>, mut cache: Local<Option<T>>) -> Option<T>
 where
-    T: PartialEq + Clone + Send + Sync + 'static + std::fmt::Debug,
+    T: PartialEq + Clone + Send + Sync + 'static,
 {
     let mut changed = false;
     if let Some(ref p) = *cache {
         if *p != current {
-            // Value changed compared to the previous one
             changed = true;
         }
-        // else: Value is the same, changed remains false
     } else {
-        // No previous value stored, so this is the first or changed
         changed = true;
     }
 
     if changed {
-        // Update the stored previous value and propagate the current one
         *cache = Some(current.clone());
         Some(current)
     } else {
-        // Value is the same as the previous one, terminate propagation
         None
     }
 }
@@ -178,11 +207,37 @@ where
 // Use Entity as an untyped SystemId for internal bookkeeping
 type UntypedSystemId = Entity;
 
-/// Helper to register a system and add the [`SystemRunner`] component.
+/// Component storing metadata for signal system nodes, primarily for reference counting.
+#[derive(Component)]
+pub(crate) struct SignalNodeMetadata {
+    /// Number of SignalHandles referencing this system node.
+    ref_count: AtomicUsize,
+}
+
+impl SignalNodeMetadata {
+    /// Creates metadata with an initial reference count of 1.
+    fn new() -> Self {
+        Self {
+            ref_count: AtomicUsize::new(1),
+        }
+    }
+
+    /// Atomically increments the reference count.
+    fn increment(&self) {
+        self.ref_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically decrements the reference count and returns the *previous* count.
+    fn decrement(&self) -> usize {
+        self.ref_count.fetch_sub(1, Ordering::Release)
+    }
+}
+
+/// Helper to register a system, add the [`SystemRunner`] component, and manage [`SignalNodeMetadata`].
 ///
-/// Ensures that the system is registered with the world and attaches a runner
-/// component that allows the [`SignalPropagator`] to execute the system with
-/// type-erased inputs and outputs. It avoids adding the runner if it already exists.
+/// Ensures the system is registered, attaches a runner component, and handles the
+/// reference counting via `SignalNodeMetadata`. Returns the `SystemId` and indicates
+/// if the node was newly created.
 pub fn register_signal<I, O, M>(
     world: &mut World,
     system: impl IntoSystem<In<I>, Option<O>, M> + 'static,
@@ -190,11 +245,14 @@ pub fn register_signal<I, O, M>(
 where
     I: FromReflect + Send + Sync + 'static,
     O: Send + FromReflect + Send + Sync + 'static,
+    M: Send + Sync + 'static,
 {
     let system_id = world.register_system(system);
     let system_entity = system_id.entity();
-    if world.get::<SystemRunner>(system_entity).is_none() {
-        world.entity_mut(system_entity).insert(SystemRunner {
+    let mut entity_mut = world.entity_mut(system_entity);
+
+    if entity_mut.get::<SystemRunner>().is_none() {
+        entity_mut.insert(SystemRunner {
             run: Arc::new(Box::new(move |world, input| {
                 let system_id = SystemId::<In<I>, Option<O>>::from_entity(system_entity);
                 match I::from_reflect(input.as_ref()) {
@@ -215,6 +273,13 @@ where
             })),
         });
     }
+
+    if let Some(metadata) = entity_mut.get::<SignalNodeMetadata>() {
+        metadata.increment();
+    } else {
+        entity_mut.insert(SignalNodeMetadata::new());
+    }
+
     system_id
 }
 
@@ -249,17 +314,17 @@ pub fn pipe_signal(world: &mut World, source: UntypedSystemId, target: UntypedSy
 
 /// Helper to register the systems needed for combining two signal branches.
 ///
-/// Creates two wrapper systems to adapt the outputs of the `left` and `right` branches
-/// into a common `(Option<OLeft>, Option<ORight>)` type. It then registers a final
-/// combining system that uses `Local` state to cache values from each branch and
-/// emits an `(OLeft, ORight)` tuple only when a value has been received from both.
-/// Connects the original branches to the wrappers, and the wrappers to the final combiner
-/// in the [`SignalPropagator`].
+/// Creates wrapper systems and a final combining system, managing reference counts
+/// and connecting them in the [`SignalPropagator`]. Returns the `SystemId` of the
+/// final combiner system and a Vec of all system entities involved in this combine step.
 pub fn combine_signal<OLeft, ORight>(
     world: &mut World,
-    left: UntypedSystemId,
-    right: UntypedSystemId,
-) -> SystemId<In<(Option<OLeft>, Option<ORight>)>, Option<(OLeft, ORight)>>
+    left_last_entity: UntypedSystemId,
+    right_last_entity: UntypedSystemId,
+) -> (
+    SystemId<In<(Option<OLeft>, Option<ORight>)>, Option<(OLeft, ORight)>>,
+    Vec<UntypedSystemId>,
+)
 where
     OLeft: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
     ORight: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
@@ -268,15 +333,15 @@ where
         world,
         |In(left_val): In<OLeft>| Some((Some(left_val), None::<ORight>)),
     );
-    pipe_signal(world, left, left_wrapper_id.entity());
+    pipe_signal(world, left_last_entity, left_wrapper_id.entity());
 
     let right_wrapper_id = register_signal::<ORight, (Option<OLeft>, Option<ORight>), _>(
         world,
         |In(right_val): In<ORight>| Some((None::<OLeft>, Some(right_val))),
     );
-    pipe_signal(world, right, right_wrapper_id.entity());
+    pipe_signal(world, right_last_entity, right_wrapper_id.entity());
 
-    let combine_id = register_signal(
+    let combine_id = register_signal::<_, _, _>(
         world,
         move |In((left_opt, right_opt)): In<(Option<OLeft>, Option<ORight>)>,
               mut left_cache: Local<Option<OLeft>>,
@@ -298,7 +363,13 @@ where
     pipe_signal(world, left_wrapper_id.entity(), combine_id.entity());
     pipe_signal(world, right_wrapper_id.entity(), combine_id.entity());
 
-    combine_id
+    let registered_entities = vec![
+        left_wrapper_id.entity(),
+        right_wrapper_id.entity(),
+        combine_id.entity(),
+    ];
+
+    (combine_id, registered_entities)
 }
 
 /// Component holding the type-erased system runner function.
@@ -313,7 +384,8 @@ pub(crate) struct SystemRunner {
         Box<
             dyn Fn(&mut World, Box<dyn PartialReflect>) -> Option<Box<dyn PartialReflect>>
                 + Send
-                + Sync,
+                + Sync
+                + 'static,
         >,
     >,
 }
@@ -381,36 +453,23 @@ impl SignalPropagator {
         entity
     }
 
-    /// Recursively removes a node and its downstream connections from the graph.
-    ///
-    /// It despawns the corresponding entity from the `World`. If a child node has other
-    /// parents, only the connection from the removed parent is severed; the child node
-    /// itself is not removed or despawned unless this was its last parent.
-    pub(crate) fn remove_node(&mut self, world: &mut World, entity: Entity) {
+    /// Removes a node from the graph structure and despawns its entity.
+    /// Called when a node's reference count reaches zero.
+    pub(crate) fn remove_graph_node(&mut self, world: &mut World, entity: Entity) {
         if !self.nodes.contains_key(&entity) {
+            if let Ok(entity_mut) = world.get_entity_mut(entity) {
+                warn!(
+                    "Despawning entity {:?} found in world but not in propagator nodes map during cleanup.",
+                    entity
+                );
+                entity_mut.despawn();
+            }
             return;
         }
 
-        if let Some(Some(children)) = self.nodes.get(&entity).cloned() {
-            for child in children {
-                if self.nodes.contains_key(&child) {
-                    let mut other_parents_exist = false;
-                    for (parent, maybe_children) in &self.nodes {
-                        if *parent != entity {
-                            if let Some(child_set) = maybe_children {
-                                if child_set.contains(&child) {
-                                    other_parents_exist = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if !other_parents_exist {
-                        self.remove_node(world, child);
-                    }
-                }
-            }
-        }
+        debug!("Removing graph node {:?}", entity);
+
+        self.roots.remove(&entity);
 
         let parents: Vec<Entity> = self
             .nodes
@@ -431,14 +490,15 @@ impl SignalPropagator {
         for parent in parents {
             if let Some(Some(children)) = self.nodes.get_mut(&parent) {
                 children.remove(&entity);
+                debug!("Removed child {:?} from parent {:?}", entity, parent);
             }
         }
 
-        self.roots.remove(&entity);
         self.nodes.remove(&entity);
+        debug!("Removed node {:?} from nodes map.", entity);
 
         if let Ok(entity_commands) = world.get_entity_mut(entity) {
-            info!("Despawning signal system entity {:?}", entity);
+            debug!("Despawning signal system entity {:?}", entity);
             entity_commands.despawn();
         } else {
             warn!(
@@ -461,12 +521,9 @@ impl SignalPropagator {
                 .and_then(|e| e.get::<SystemRunner>())
                 .cloned()
             {
-                // Run the root system (input is always () for roots)
                 if let Some(output) = runner.run(world, Box::new(())) {
-                    // If the root produced output, start propagating to its children
                     self.process_children(root_entity, world, output);
                 }
-                // If runner.run returned None, propagation stops here for this root this frame.
             } else {
                 warn!(
                     "SystemRunner component not found for root entity {:?}",
@@ -496,12 +553,9 @@ impl SignalPropagator {
                     .and_then(|e| e.get::<SystemRunner>())
                     .cloned()
                 {
-                    // Run the child system with the input from the parent
                     if let Some(output) = runner.run(world, input.clone_value()) {
-                        // If the child produced output, continue propagation to its children
                         self.process_children(child_entity, world, output);
                     }
-                    // If runner.run returned None, propagation stops here for this child this frame.
                 } else {
                     warn!(
                         "SystemRunner component not found for child entity {:?}",
@@ -510,291 +564,300 @@ impl SignalPropagator {
                 }
             }
         }
-        // If node has no children (or children set is None), propagation naturally stops here.
     }
 }
 
-/// Trait abstracting over the different types of signal chain nodes
-/// (source, map, combine) during the registration phase.
-pub(crate) trait ISignal: Send + Sync {
+/// Internal trait handling the registration logic for different signal node types.
+/// **Note:** This trait is intended for internal use only.
+pub trait SignalBuilderInternal: Send + Sync + 'static {
+    /// The logical output type of this signal node.
+    type Item: Send + Sync + 'static;
+
     /// Registers the systems associated with this node and its predecessors in the `World`.
-    /// Returns the `UntypedSystemId` (Entity) of the *last* system registered by this node.
-    fn register(&self, world: &mut World) -> UntypedSystemId;
+    /// Returns a `Vec<UntypedSystemId>` containing the entities of *all* systems
+    /// registered or reference-counted during this specific registration call instance.
+    fn register(&self, world: &mut World) -> Vec<UntypedSystemId>;
 }
 
-/// Struct representing a source node in the signal chain definition.
-/// Contains the function that registers the initial system.
-pub(crate) struct SourceSignal<F>
-where
-    F: Fn(&mut World) -> UntypedSystemId + Send + Sync + 'static + ?Sized,
-{
-    /// The function responsible for registering the source system.
-    pub(crate) register_fn: Arc<F>,
-}
-
-impl<F> ISignal for SourceSignal<F>
-where
-    F: Fn(&mut World) -> UntypedSystemId + Send + Sync + 'static + ?Sized,
-{
-    /// Executes the stored `register_fn` to register the source system.
-    fn register(&self, world: &mut World) -> UntypedSystemId {
-        (self.register_fn)(world)
-    }
-}
-
-/// Struct representing a map node in the signal chain definition.
-/// Contains a reference to the previous node and the function to register the mapping system.
-pub(crate) struct MapSignal<F>
-where
-    F: Fn(&mut World, UntypedSystemId) -> UntypedSystemId + Send + Sync + 'static + ?Sized,
-{
-    /// The preceding node in the signal chain definition.
-    pub(crate) prev_signal: Arc<dyn ISignal>,
-    /// The function responsible for registering the map system and piping it.
-    pub(crate) register_fn: Arc<F>,
-}
-
-impl<F> ISignal for MapSignal<F>
-where
-    F: Fn(&mut World, UntypedSystemId) -> UntypedSystemId + Send + Sync + 'static + ?Sized,
-{
-    /// Recursively registers the previous node, then executes the stored `register_fn`
-    /// to register the map system and connect it to the previous one.
-    fn register(&self, world: &mut World) -> UntypedSystemId {
-        let prev_id = self.prev_signal.register(world);
-        (self.register_fn)(world, prev_id)
-    }
-}
-
-/// Struct representing a combine node in the signal chain definition.
-/// Contains references to the two parent nodes and the function to register the combining systems.
-pub(crate) struct CombineSignal<F>
-where
-    F: Fn(&mut World, UntypedSystemId, UntypedSystemId) -> UntypedSystemId
-        + Send
-        + Sync
-        + 'static
-        + ?Sized,
-{
-    /// The left parent node in the signal chain definition.
-    pub(crate) left_signal: Arc<dyn ISignal>,
-    /// The right parent node in the signal chain definition.
-    pub(crate) right_signal: Arc<dyn ISignal>,
-    /// The function responsible for registering the combine systems and piping them.
-    pub(crate) register_fn: Arc<F>,
-}
-
-impl<F> ISignal for CombineSignal<F>
-where
-    F: Fn(&mut World, UntypedSystemId, UntypedSystemId) -> UntypedSystemId
-        + Send
-        + Sync
-        + 'static
-        + ?Sized,
-{
-    /// Recursively registers both parent nodes, then executes the stored `register_fn`
-    /// to register the necessary combining/wrapper systems and connect them.
-    fn register(&self, world: &mut World) -> UntypedSystemId {
-        let left_id = self.left_signal.register(world);
-        let right_id = self.right_signal.register(world);
-        (self.register_fn)(world, left_id, right_id)
-    }
-}
-
-/// Handle returned by [`Signal::register`] used for cleaning up the registered signal chain.
+/// Represents a value that changes over time.
 ///
-/// Dropping the handle does *not* automatically clean up the signal. Cleanup must be
-/// explicitly requested using the [`cleanup`](SignalHandle::cleanup) method.
-// Add Debug derive for potential use in user code assertions
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SignalHandle(UntypedSystemId);
+/// Signals are the core building block for reactive data flow. They are typically
+/// created using methods on the [`SignalBuilder`] struct (e.g., [`SignalBuilder::from_component`])
+/// and then transformed or combined using methods from the [`SignalExt`] trait.
+pub trait Signal: Send + Sync + 'static {
+    /// The type of value produced by this signal.
+    type Item: Send + Sync + 'static;
+}
+
+/// Struct representing a source node in the signal chain definition. Implements [`Signal`].
+#[derive(Clone)]
+pub struct Source<O>
+where
+    O: Send + Sync + 'static,
+{
+    /// The type-erased function responsible for registering the source system.
+    pub(crate) register_fn: Arc<SourceRegisterFn<O>>,
+    _marker: PhantomData<O>,
+}
+
+// Implement internal registration logic
+impl<O> SignalBuilderInternal for Source<O>
+where
+    O: Send + Sync + 'static,
+{
+    type Item = O;
+
+    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
+        let system_id = (self.register_fn)(world);
+        vec![system_id.entity()]
+    }
+}
+
+// Implement the public Signal trait
+impl<O> Signal for Source<O>
+where
+    O: Send + Sync + 'static,
+{
+    type Item = O;
+}
+
+/// Struct representing a map node in the signal chain definition. Implements [`Signal`].
+/// Generic only over the previous signal (`Prev`) and the output type (`U`).
+pub struct Map<Prev, U>
+where
+    Prev: SignalBuilderInternal,
+    U: Send + Sync + 'static,
+    <Prev as SignalBuilderInternal>::Item: Send + Sync + 'static,
+{
+    pub(crate) prev_signal: Prev,
+    pub(crate) register_fn: Arc<MapRegisterFn>,
+    _marker: PhantomData<U>,
+}
+
+// Add Clone implementation for Map
+impl<Prev, U> Clone for Map<Prev, U>
+where
+    Prev: SignalBuilderInternal + Clone,
+    U: Send + Sync + 'static,
+    <Prev as SignalBuilderInternal>::Item: Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prev_signal: self.prev_signal.clone(),
+            register_fn: self.register_fn.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+// Implement internal registration logic for Map<Prev, U>
+impl<Prev, U> SignalBuilderInternal for Map<Prev, U>
+where
+    Prev: SignalBuilderInternal,
+    U: FromReflect + Send + Sync + 'static,
+    <Prev as SignalBuilderInternal>::Item: FromReflect + Send + Sync + 'static,
+{
+    type Item = U;
+
+    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
+        let mut prev_ids = self.prev_signal.register(world);
+        if let Some(&prev_last_id_entity) = prev_ids.last() {
+            let new_system_entity = (self.register_fn)(world, prev_last_id_entity);
+            prev_ids.push(new_system_entity);
+        } else {
+            error!("Map signal parent registration returned empty ID list.");
+        }
+        prev_ids
+    }
+}
+
+// Implement the public Signal trait for Map<Prev, U>
+impl<Prev, U> Signal for Map<Prev, U>
+where
+    Prev: SignalBuilderInternal,
+    U: Send + Sync + 'static,
+    <Prev as SignalBuilderInternal>::Item: Send + Sync + 'static,
+    Prev: Signal<Item = <Prev as SignalBuilderInternal>::Item>,
+{
+    type Item = U;
+}
+
+/// Struct representing a combine node in the signal chain definition. Implements [`Signal`].
+pub struct Combine<Left, Right>
+where
+    Left: Signal + SignalBuilderInternal,
+    Right: Signal + SignalBuilderInternal,
+    <Left as Signal>::Item: Send + Sync + 'static,
+    <Right as Signal>::Item: Send + Sync + 'static,
+{
+    pub(crate) left_signal: Left,
+    pub(crate) right_signal: Right,
+    pub(crate) register_fn: Arc<CombineRegisterFn<<Left as Signal>::Item, <Right as Signal>::Item>>,
+    _marker: PhantomData<(<Left as Signal>::Item, <Right as Signal>::Item)>,
+}
+
+// Add Clone implementation for Combine
+impl<Left, Right> Clone for Combine<Left, Right>
+where
+    Left: Signal + SignalBuilderInternal + Clone,
+    Right: Signal + SignalBuilderInternal + Clone,
+    <Left as Signal>::Item: Send + Sync + 'static,
+    <Right as Signal>::Item: Send + Sync + 'static,
+    Arc<CombineRegisterFn<<Left as Signal>::Item, <Right as Signal>::Item>>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            left_signal: self.left_signal.clone(),
+            right_signal: self.right_signal.clone(),
+            register_fn: self.register_fn.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+// Implement internal registration logic
+impl<Left, Right> SignalBuilderInternal for Combine<Left, Right>
+where
+    Left: Signal + SignalBuilderInternal,
+    Right: Signal + SignalBuilderInternal,
+    <Left as Signal>::Item: Send + Sync + 'static,
+    <Right as Signal>::Item: Send + Sync + 'static,
+{
+    type Item = (<Left as Signal>::Item, <Right as Signal>::Item);
+
+    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
+        let mut left_ids = self.left_signal.register(world);
+        let mut right_ids = self.right_signal.register(world);
+
+        let combined_ids = if let (Some(&left_last_id), Some(&right_last_id)) =
+            (left_ids.last(), right_ids.last())
+        {
+            let (_combine_system_id, combine_node_ids) =
+                (self.register_fn)(world, left_last_id, right_last_id);
+            combine_node_ids
+        } else {
+            error!("CombineSignal parent registration returned empty ID list(s).");
+            Vec::new()
+        };
+
+        left_ids.append(&mut right_ids);
+        left_ids.extend(combined_ids);
+        left_ids
+    }
+}
+
+// Implement the public Signal trait
+impl<Left, Right> Signal for Combine<Left, Right>
+where
+    Left: Signal + SignalBuilderInternal,
+    Right: Signal + SignalBuilderInternal,
+    <Left as Signal>::Item: Send + Sync + 'static,
+    <Right as Signal>::Item: Send + Sync + 'static,
+{
+    type Item = (<Left as Signal>::Item, <Right as Signal>::Item);
+}
+
+/// Handle returned by [`SignalExt::register`] used for cleaning up the registered signal chain.
+///
+/// Contains the list of all system entities created by the specific `register` call
+/// that produced this handle. Dropping the handle does *not* automatically clean up.
+/// Use the [`cleanup`](SignalHandle::cleanup) method for explicit cleanup.
+#[derive(Clone, Debug)]
+pub struct SignalHandle(Vec<UntypedSystemId>);
 
 impl SignalHandle {
-    /// Removes the system associated with this handle and all its downstream signal systems
-    /// from the internal signal graph and despawns their associated entities from the Bevy `World`.
-    ///
-    /// This operation traverses the signal graph downstream from the handle's system.
-    /// If a downstream system is only reachable through this path, it will be removed.
-    /// If a downstream system has other parents in the signal graph, it will *not* be removed.
-    /// Upstream systems are never affected by cleaning up a downstream handle.
-    ///
-    /// **Note:** Requires mutable access to the `World` to despawn entities and access the
-    /// internal `SignalPropagator` resource.
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// #[derive(Component, Reflect, Clone, Default, PartialEq)]
-    /// #[reflect(Component)]
-    /// struct MyData(i32);
-    ///
-    /// let mut world = World::new();
-    /// world.init_resource::<SignalPropagator>(); // Need the propagator
-    /// let entity = world.spawn(MyData(0)).id();
-    ///
-    /// let signal = Signal::from_component::<MyData>(entity)
-    ///     .map(|In(d): In<MyData>| { println!("Data: {}", d.0); TERMINATE });
-    ///
-    /// // Register the signal
-    /// let handle = signal.register(&mut world);
-    ///
-    /// // Later, cleanup the signal
-    /// handle.cleanup(&mut world);
-    ///
-    /// // The systems associated with the handle should now be despawned.
-    /// // Verification would require checking world state, complex for a doctest.
-    /// ```
+    /// Decrements the reference count for each system associated with this handle.
+    /// If a system's reference count reaches zero, it removes the system's node
+    /// from the internal signal graph and despawns its associated entity from the Bevy `World`.
     pub fn cleanup(self, world: &mut World) {
         if let Some(mut propagator) = world.remove_resource::<SignalPropagator>() {
-            propagator.remove_node(world, self.0);
+            let mut nodes_to_remove = Vec::new();
+            for system_entity in &self.0 {
+                if let Some(metadata) = world.get::<SignalNodeMetadata>(*system_entity) {
+                    if metadata.decrement() == 1 {
+                        nodes_to_remove.push(*system_entity);
+                    }
+                } else {
+                    warn!(
+                        "SignalNodeMetadata not found for system {:?} during cleanup.",
+                        system_entity
+                    );
+                }
+            }
+
+            for entity_to_remove in nodes_to_remove {
+                propagator.remove_graph_node(world, entity_to_remove);
+            }
+
             world.insert_resource(propagator);
         } else {
             warn!(
-                "SignalPropagator not found during cleanup for system {:?}",
-                self.0
+                "SignalPropagator not found during cleanup. Cannot decrement reference counts or remove nodes."
             );
-            if let Ok(entity_commands) = world.get_entity_mut(self.0) {
-                warn!(
-                    "Despawning entity {:?} directly as SignalPropagator was missing.",
-                    self.0
-                );
-                entity_commands.despawn();
+            for system_entity in self.0 {
+                if let Ok(entity_mut) = world.get_entity_mut(system_entity) {
+                    entity_mut.despawn();
+                }
             }
         }
     }
 }
 
-/// A declarative builder for creating signal chains.
-///
-/// `Signal<I, O>` represents a computation that conceptually transforms
-/// signals of type `I` into signals of type `O`. However, `I` is often `()`
-/// for source signals.
-///
-/// Use the `from_*` static methods (e.g., [`Signal::from_component`]) to start a chain,
-/// then chain combinators like [`map`](Signal::map) and [`combine_with`](Signal::combine_with).
-/// Finally, call [`register`](Signal::register) to activate the signal chain by creating
-/// the necessary Bevy systems.
-///
-/// Signals are `Clone`, allowing the description of a chain to be reused or passed around
-/// before registration. Registration itself (`register`) does not consume the `Signal`
-/// due to the internal use of `Arc`. Registering the same `Signal` multiple times is safe
-/// (it won't duplicate systems or connections) but will return distinct [`SignalHandle`]s
-/// pointing to the same underlying final system.
-#[derive(Clone)]
-pub struct Signal<I: Send + Sync + 'static, O: Send + Sync + 'static> {
-    /// Internal implementation detail holding the actual signal node definition.
-    /// This uses `Arc<dyn ISignal>` for type erasure and shared ownership.
-    pub(crate) signal_impl: Arc<dyn ISignal>,
-    /// Marker for input/output types, not used functionally but helps with type inference.
-    pub(crate) _marker: PhantomData<fn() -> (I, O)>,
-}
-
 /// Helper to create a source signal node. Wraps the registration function
-/// in the `SourceSignal` struct and creates the public `Signal` type.
-pub(crate) fn create_source<O>(
-    register_fn: Arc<dyn Fn(&mut World) -> UntypedSystemId + Send + Sync + 'static>,
-) -> Signal<(), O>
+/// in the `Source` struct, boxing the function.
+pub(crate) fn create_source<F, O>(register_fn: F) -> Source<O>
 where
     O: Send + Sync + 'static,
+    F: Fn(&mut World) -> SystemId<In<()>, Option<O>> + Send + Sync + 'static,
 {
-    let source_signal = SourceSignal { register_fn };
-    Signal {
-        signal_impl: Arc::new(source_signal),
-        _marker: PhantomData,
+    Source {
+        register_fn: Arc::new(register_fn),
+        _marker: std::marker::PhantomData,
     }
 }
 
-// Static methods to start signal chains
-impl Signal<(), ()> {
-    /// Starts a signal chain from an arbitrary Bevy system.
+/// Provides static methods for creating new signal chains (source signals).
+/// Use methods like [`SignalBuilder::from_component`] or [`SignalBuilder::from_system`]
+/// to start building a signal chain.
+pub struct SignalBuilder;
+
+// Static methods to start signal chains, now associated with SignalBuilder struct
+impl SignalBuilder {
+    /// Creates a signal chain starting from a custom Bevy system.
     ///
-    /// The provided `system` must take `In<()>` and return `Option<O>`.
-    /// It will be registered as a "root" signal, meaning its execution is triggered
-    /// automatically by the [`SignalPropagator`] each update cycle.
-    ///
-    /// The signal emits values of type `O` whenever the system returns `Some(O)`.
-    ///
-    /// The system needs to be `Clone` because the `Signal` itself is `Clone`.
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// fn my_source_system(_: In<()>) -> Option<i32> {
-    ///     Some(42)
-    /// }
-    ///
-    /// let signal = Signal::from_system(my_source_system);
-    ///
-    /// // To activate, register it:
-    /// // let mut world = World::new();
-    /// // world.init_resource::<SignalPropagator>();
-    /// // let handle = signal.register(&mut world);
-    /// ```
-    pub fn from_system<O, M>(
-        system: impl IntoSystem<In<()>, Option<O>, M> + Send + Sync + Clone + 'static,
-    ) -> Signal<(), O>
+    /// The provided system should take `In<()>` and return `Option<O>`.
+    /// This system will be registered as a root node for signal propagation.
+    /// The system `F` must be `Clone` as it's captured for registration.
+    pub fn from_system<O, M, F>(system: F) -> Source<O>
     where
         O: FromReflect + Send + Sync + 'static,
+        F: IntoSystem<In<()>, Option<O>, M> + Send + Sync + Clone + 'static,
+        M: Send + Sync + 'static,
     {
-        let register_fn = Arc::new(move |world: &mut World| {
-            let system_id = register_signal(world, system.clone());
+        let register_fn = move |world: &mut World| {
+            let system_id = register_signal::<(), O, M>(world, system.clone());
             mark_signal_root(world, system_id.entity());
-            system_id.entity()
-        });
+            system_id
+        };
         create_source(register_fn)
     }
 
-    /// Starts a signal chain that emits an `Entity` ID once.
+    /// Creates a signal chain starting from a specific entity.
     ///
-    /// This is often used as a starting point for chains that then query components
-    /// on that specific entity using [`map`](Signal::map).
-    ///
-    /// Internally uses [`entity_root`] and [`Signal::from_system`].
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// // Assume 'my_entity' is an Entity created elsewhere
-    /// let my_entity = Entity::PLACEHOLDER;
-    /// let signal = Signal::from_entity(my_entity);
-    ///
-    /// // To activate, register it:
-    /// // let mut world = World::new();
-    /// // world.init_resource::<SignalPropagator>();
-    /// // let handle = signal.register(&mut world);
-    /// ```
-    pub fn from_entity(entity: Entity) -> Signal<(), Entity> {
+    /// The signal will emit the `Entity` ID whenever the propagation starts from this source.
+    /// Useful for chains that operate on or react to changes related to this entity.
+    /// Internally uses [`SignalBuilder::from_system`] with [`entity_root`].
+    pub fn from_entity(entity: Entity) -> Source<Entity> {
         Self::from_system(entity_root(entity))
     }
 
-    /// Starts a signal chain that emits when a specific component `C` on a given `entity` changes.
+    /// Creates a signal chain that starts by observing changes to a specific component `C`
+    /// on a given `entity`.
     ///
-    /// The signal emits the new value of the component `C` whenever Bevy's change detection
-    /// (`Changed<C>`) detects a change for that specific entity.
-    ///
+    /// The signal emits the new value of the component `C` whenever it changes on the entity.
     /// Requires the component `C` to implement `Component`, `FromReflect`, `Clone`, `Send`, `Sync`, and `'static`.
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// #[derive(Component, Reflect, Clone, Default, PartialEq)]
-    /// #[reflect(Component)]
-    /// struct MyComponent(i32);
-    ///
-    /// // Assume 'my_entity' is an Entity with MyComponent created elsewhere
-    /// let my_entity = Entity::PLACEHOLDER;
-    /// let signal = Signal::from_component::<MyComponent>(my_entity);
-    ///
-    /// // To activate, register it:
-    /// // let mut world = World::new();
-    /// // world.init_resource::<SignalPropagator>();
-    /// // let handle = signal.register(&mut world);
-    /// ```
-    pub fn from_component<C>(entity: Entity) -> Signal<(), C>
+    /// Internally uses [`SignalBuilder::from_system`].
+    pub fn from_component<C>(entity: Entity) -> Source<C>
     where
         C: Component + FromReflect + Clone + Send + Sync + 'static,
     {
@@ -803,30 +866,12 @@ impl Signal<(), ()> {
         Self::from_system(component_query_system)
     }
 
-    /// Starts a signal chain that emits when a specific resource `R` changes.
+    /// Creates a signal chain that starts by observing changes to a specific resource `R`.
     ///
-    /// The signal emits a clone of the resource `R` whenever Bevy's change detection
-    /// (`Res<R>::is_changed()`) detects a change.
-    ///
+    /// The signal emits the new value of the resource `R` whenever it changes.
     /// Requires the resource `R` to implement `Resource`, `FromReflect`, `Clone`, `Send`, `Sync`, and `'static`.
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// #[derive(Resource, Reflect, Clone, Default, PartialEq)]
-    /// #[reflect(Resource)]
-    /// struct MyResource(f32);
-    ///
-    /// let signal = Signal::from_resource::<MyResource>();
-    ///
-    /// // To activate, register it:
-    /// // let mut world = World::new();
-    /// // world.init_resource::<SignalPropagator>();
-    /// // world.init_resource::<MyResource>();
-    /// // let handle = signal.register(&mut world);
-    /// ```
-    pub fn from_resource<R>() -> Signal<(), R>
+    /// Internally uses [`SignalBuilder::from_system`].
+    pub fn from_resource<R>() -> Source<R>
     where
         R: Resource + FromReflect + Clone + Send + Sync + 'static,
     {
@@ -841,126 +886,122 @@ impl Signal<(), ()> {
     }
 }
 
-// Combinator methods
-impl<I, O> Signal<I, O>
-where
-    I: Send + Sync + 'static,
-    O: FromReflect + Send + Sync + 'static,
-{
+/// Extension trait providing combinator methods for types implementing [`Signal`],
+/// [`SignalBuilderInternal`], and [`Clone`].
+pub trait SignalExt: Signal + SignalBuilderInternal + Clone {
     /// Appends a transformation step to the signal chain using a Bevy system.
     ///
-    /// The provided `system` takes the output `O` of the previous step as `In<O>`
-    /// and should return `Option<U>`.
-    /// - If the system returns `Some(U)`, the value `U` is propagated to the next step in the graph.
-    /// - If the system returns `None`, the signal chain terminates *along this path* for the current
-    ///   frame's execution (see [`TERMINATE`]). Propagation stops here.
+    /// The provided `system` takes the output `Item` of the previous step (wrapped in `In<Item>`)
+    /// and returns an `Option<U>`. If it returns `Some(U)`, `U` is propagated to the next step.
+    /// If it returns `None` (or [`TERMINATE`]), propagation along this branch stops for the frame.
     ///
-    /// The system needs to be `Clone` because the `Signal` itself is `Clone`.
-    ///
-    /// Common uses include:
-    /// - Querying data based on the input signal (e.g., querying components using an `Entity` signal).
-    /// - Transforming the data type.
-    /// - Filtering signals by returning `None`.
-    /// - Performing side effects (e.g., using `Commands`).
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// fn multiply_by_two(In(val): In<i32>) -> Option<i32> {
-    ///     Some(val * 2)
-    /// }
-    ///
-    /// fn print_and_terminate(In(val): In<i32>) {
-    ///     println!("Final value: {}", val);
-    ///     // Implicitly returns None / TERMINATE, stopping further propagation.
-    /// }
-    ///
-    /// let signal = Signal::from_system(|| Some(5)) // Source emits 5
-    ///     .map(multiply_by_two) // Emits 10
-    ///     .map(print_and_terminate); // Prints 10 and terminates this path
-    ///
-    /// // To activate, register it:
-    /// // let mut world = World::new();
-    /// // world.init_resource::<SignalPropagator>();
-    /// // let handle = signal.register(&mut world);
-    /// ```
-    pub fn map<U, M>(
-        self,
-        system: impl IntoSystem<In<O>, Option<U>, M> + Send + Sync + Clone + 'static,
-    ) -> Signal<I, U>
+    /// The system `F` must be `Clone` as it's captured for registration.
+    /// Returns a [`Map`] signal node.
+    fn map<U, M, F>(self, system: F) -> Map<Self, U>
     where
+        Self: Sized,
+        <Self as SignalBuilderInternal>::Item: Send + Sync + 'static,
+        <Self as SignalBuilderInternal>::Item: FromReflect + Send + Sync + 'static,
         U: FromReflect + Send + Sync + 'static,
+        F: IntoSystem<In<<Self as SignalBuilderInternal>::Item>, Option<U>, M>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+        M: Send + Sync + 'static;
+
+    /// Combines this signal with another signal (`other`), producing a new signal that emits
+    /// a tuple `(Self::Item, S2::Item)` of the outputs of both signals.
+    ///
+    /// The new signal emits a value only when *both* input signals have emitted at least one
+    /// value since the last combined emission. It caches the latest value from each input.
+    /// Both `self` and `other` must implement `Clone`.
+    /// Returns a [`Combine`] signal node.
+    fn combine_with<S2>(self, other: S2) -> Combine<Self, S2>
+    where
+        Self: Sized,
+        S2: Signal + SignalBuilderInternal + Clone,
+        <Self as Signal>::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + Clone
+            + 'static
+            + std::fmt::Debug,
+        <S2 as Signal>::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + Clone
+            + 'static
+            + std::fmt::Debug;
+
+    /// Registers all the systems defined in this signal chain into the Bevy `World`.
+    ///
+    /// This activates the signal chain. It traverses the internal representation (calling
+    /// [`SignalBuilderInternal::register`] recursively), registers each required Bevy system
+    /// (or increments its reference count if already registered), connects them in the
+    /// [`SignalPropagator`], and marks the source system(s) as roots.
+    ///
+    /// Returns a [`SignalHandle`] which can be used later to [`cleanup`](SignalHandle::cleanup)
+    /// the systems created or referenced specifically by *this* `register` call.
+    fn register(&self, world: &mut World) -> SignalHandle;
+}
+
+// Implement SignalExt for any type T that implements Signal + SignalBuilderInternal + Clone
+impl<T> SignalExt for T
+where
+    T: Signal + SignalBuilderInternal<Item = <T as Signal>::Item> + Clone,
+{
+    fn map<U, M, F>(self, system: F) -> Map<Self, U>
+    where
+        <T as SignalBuilderInternal>::Item: Send + Sync + 'static,
+        <T as SignalBuilderInternal>::Item: FromReflect + Send + Sync + 'static,
+        U: FromReflect + Send + Sync + 'static,
+        F: IntoSystem<In<<T as SignalBuilderInternal>::Item>, Option<U>, M>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+        M: Send + Sync + 'static,
     {
-        let register_fn = Arc::new(move |world: &mut World, prev_id_entity: UntypedSystemId| {
-            let new_system_id = register_signal(world, system.clone());
-            pipe_signal(world, prev_id_entity, new_system_id.entity());
-            new_system_id.entity()
-        });
+        let system_clone = system.clone();
 
-        let map_signal = MapSignal {
-            prev_signal: self.signal_impl.clone(),
+        let register_fn = Arc::new(
+            move |world: &mut World, prev_last_id_entity: UntypedSystemId| -> UntypedSystemId {
+                let system_id = register_signal::<<T as SignalBuilderInternal>::Item, U, M>(
+                    world,
+                    system_clone.clone(),
+                );
+
+                let system_entity = system_id.entity();
+
+                pipe_signal(world, prev_last_id_entity, system_entity);
+
+                system_entity
+            },
+        );
+
+        Map {
+            prev_signal: self,
             register_fn,
-        };
-
-        Signal {
-            signal_impl: Arc::new(map_signal),
             _marker: PhantomData,
         }
     }
-}
-
-impl<I, O> Signal<I, O>
-where
-    I: Send + Sync + 'static,
-    O: FromReflect + GetTypeRegistration + Typed + Send + Sync + Clone + 'static + std::fmt::Debug,
-{
-    /// Combines this signal chain (`self`) with another signal chain (`other`).
-    ///
-    /// This method creates a new signal that waits until *both* `self` and `other`
-    /// have produced at least one value. Once both have produced a value, it emits
-    /// a tuple `(O, O2)` containing the *most recent* value from each chain.
-    ///
-    /// After emitting, it resets and waits for the next pair of values from both branches.
-    /// If one branch produces multiple values while waiting for the other, only the
-    /// latest value from the faster branch is used when the combination finally occurs.
-    ///
-    /// Requires the output types `O` and `O2` to implement necessary reflection traits
-    /// (`FromReflect`, `GetTypeRegistration`, `Typed`) and `Clone` for internal caching.
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// #[derive(Resource, Reflect, Clone, Default, PartialEq, Debug)]
-    /// #[reflect(Resource)]
-    /// struct SourceA(i32);
-    ///
-    /// #[derive(Resource, Reflect, Clone, Default, PartialEq, Debug)]
-    /// #[reflect(Resource)]
-    /// struct SourceB(String);
-    ///
-    /// let signal_a = Signal::from_resource::<SourceA>();
-    /// let signal_b = Signal::from_resource::<SourceB>();
-    ///
-    /// let combined_signal = signal_a
-    ///     .combine_with(signal_b)
-    ///     .map(|In((a, b)): In<(SourceA, SourceB)>| {
-    ///         println!("Combined: {:?}, {:?}", a, b);
-    ///         TERMINATE
-    ///     });
-    ///
-    /// // To activate, register it:
-    /// // let mut world = World::new();
-    /// // world.init_resource::<SignalPropagator>();
-    /// // world.init_resource::<SourceA>();
-    /// // world.init_resource::<SourceB>();
-    /// // let handle = combined_signal.register(&mut world);
-    /// ```
-    pub fn combine_with<I2, O2>(self, other: Signal<I2, O2>) -> Signal<(), (O, O2)>
+    fn combine_with<S2>(self, other: S2) -> Combine<Self, S2>
     where
-        I2: Send + Sync + 'static,
-        O2: FromReflect
+        S2: Signal + SignalBuilderInternal + Clone,
+        <Self as Signal>::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + Clone
+            + 'static
+            + std::fmt::Debug,
+        <S2 as Signal>::Item: FromReflect
             + GetTypeRegistration
             + Typed
             + Send
@@ -969,75 +1010,35 @@ where
             + 'static
             + std::fmt::Debug,
     {
-        let register_fn = Arc::new(
-            move |world: &mut World,
-                  left_id_entity: UntypedSystemId,
-                  right_id_entity: UntypedSystemId| {
-                let combined_id = combine_signal::<O, O2>(world, left_id_entity, right_id_entity);
-                combined_id.entity()
-            },
-        );
-
-        let combine_signal = CombineSignal {
-            left_signal: self.signal_impl.clone(),
-            right_signal: other.signal_impl.clone(),
-            register_fn,
+        let register_fn = move |world: &mut World,
+                                left_id_entity: UntypedSystemId,
+                                right_id_entity: UntypedSystemId| {
+            combine_signal::<<Self as Signal>::Item, <S2 as Signal>::Item>(
+                world,
+                left_id_entity,
+                right_id_entity,
+            )
         };
 
-        Signal {
-            signal_impl: Arc::new(combine_signal),
+        Combine {
+            left_signal: self,
+            right_signal: other,
+            register_fn: Arc::new(register_fn)
+                as Arc<CombineRegisterFn<<Self as Signal>::Item, <S2 as Signal>::Item>>,
             _marker: PhantomData,
         }
     }
-}
 
-impl<I, O> Signal<I, O>
-where
-    I: Send + Sync + 'static,
-    O: Send + Sync + 'static,
-{
-    /// Registers all systems involved in this signal chain within the Bevy `World`.
-    ///
-    /// This activates the signal chain. It traverses the chain definition, registers
-    /// each system, connects them in the internal [`SignalPropagator`] graph, and marks
-    /// root systems.
-    ///
-    /// Returns a [`SignalHandle`] which can be used later to [`cleanup`](SignalHandle::cleanup)
-    /// the registered systems and connections associated with this specific chain instance.
-    ///
-    /// **Note:** This method takes `&self` and does not consume the `Signal`. Calling
-    /// `register` multiple times on the same `Signal` or clones of it is safe (systems
-    /// and connections are not duplicated), but it will return new `SignalHandle`s
-    /// pointing to the same underlying final system entity. Cleaning up one handle
-    /// will affect the graph shared by all handles derived from the same registration(s).
-    ///
-    /// ```no_run
-    /// use bevy::prelude::*;
-    /// use jonmo::*;
-    ///
-    /// let signal = Signal::from_system(|| Some(1))
-    ///     .map(|In(x): In<i32>| Some(x + 1));
-    ///
-    /// let mut world = World::new();
-    /// world.init_resource::<SignalPropagator>(); // Plugin normally does this
-    ///
-    /// // Register the signal chain
-    /// let handle: SignalHandle = signal.register(&mut world);
-    ///
-    /// // The handle identifies the last system in the chain
-    /// println!("Registered signal with handle: {:?}", handle);
-    ///
-    /// // You can now use the handle to clean up later if needed
-    /// // handle.cleanup(&mut world);
-    /// ```
-    pub fn register(&self, world: &mut World) -> SignalHandle {
-        let last_system_id = self.signal_impl.register(world);
-        SignalHandle(last_system_id)
+    fn register(&self, world: &mut World) -> SignalHandle {
+        let all_system_ids = <T as SignalBuilderInternal>::register(self, world);
+        SignalHandle(all_system_ids)
     }
 }
 
 /// System that drives signal propagation by calling [`SignalPropagator::execute`].
 /// Added to the `Update` schedule by the [`JonmoPlugin`]. This system runs once per frame.
+/// It temporarily removes the [`SignalPropagator`] resource to allow mutable access to the `World`
+/// during system execution within the propagator.
 pub(crate) fn process_signals(world: &mut World) {
     if let Some(propagator) = world.remove_resource::<SignalPropagator>() {
         propagator.execute(world);
@@ -1048,11 +1049,11 @@ pub(crate) fn process_signals(world: &mut World) {
 /// The Bevy plugin required for `jonmo` signals to function.
 ///
 /// Adds the necessary [`SignalPropagator`] resource and the system that drives
-/// signal propagation (`process_signals`) to the `Update` schedule.
+/// signal propagation ([`process_signals`]) to the `Update` schedule.
 ///
 /// ```no_run
 /// use bevy::prelude::*;
-/// use jonmo::JonmoPlugin;
+/// use jonmo::prelude::*; // Use prelude
 ///
 /// App::new()
 ///     .add_plugins(DefaultPlugins)
@@ -1070,349 +1071,19 @@ impl Plugin for JonmoPlugin {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*; // Import items from the library root
-    use std::sync::{Arc, Mutex};
-
-    // Helper component to track if a system ran
-    #[derive(Component, Default, Clone, Debug, PartialEq)]
-    struct Ran(bool);
-
-    // Helper component for component-based signals
-    #[derive(Component, Reflect, Clone, Default, PartialEq, Debug)]
-    #[reflect(Component)]
-    struct TestValue(i32);
-
-    // Helper resource for resource-based signals
-    #[derive(Resource, Reflect, Clone, Default, PartialEq, Debug)]
-    #[reflect(Resource)]
-    struct TestResource(String);
-
-    // Helper resource to store results for assertions
-    #[derive(Resource, Default)]
-    struct TestResult<T: Send + Sync + 'static>(Arc<Mutex<Option<T>>>);
-
-    impl<T: Send + Sync + 'static> TestResult<T> {
-        fn set(&self, value: T) {
-            *self.0.lock().unwrap() = Some(value);
-        }
-        // fn get(&self) -> Option<T> // Not used in current tests
-        // where
-        //     T: Clone,
-        // {
-        //     self.0.lock().unwrap().clone()
-        // }
-        fn take(&self) -> Option<T> {
-            self.0.lock().unwrap().take()
-        }
-    }
-
-    // Helper resource to store vec results for assertions
-    #[derive(Resource, Default)]
-    struct TestVecResult<T: Send + Sync + 'static>(Arc<Mutex<Vec<T>>>);
-
-    impl<T: Send + Sync + 'static> TestVecResult<T> {
-        fn push(&self, value: T) {
-            self.0.lock().unwrap().push(value);
-        }
-        fn get_cloned(&self) -> Vec<T>
-        where
-            T: Clone,
-        {
-            self.0.lock().unwrap().clone()
-        }
-    }
-
-    // Helper resource to store counter results for assertions
-    #[derive(Resource, Default)]
-    struct TestCounterResult(Arc<Mutex<i32>>);
-
-    impl TestCounterResult {
-        fn increment(&self, value: i32) {
-            *self.0.lock().unwrap() += value;
-        }
-        fn get(&self) -> i32 {
-            *self.0.lock().unwrap()
-        }
-    }
-
-    // --- Test Setup ---
-
-    fn setup_app() -> App {
-        let mut app = App::new();
-        // Use MinimalPlugins for lighter testing if DefaultPlugins are too heavy
-        // app.add_plugins(MinimalPlugins);
-        app.add_plugins(JonmoPlugin);
-        // Register types needed for tests
-        app.register_type::<TestValue>();
-        app.register_type::<TestResource>();
-        app
-    }
-
-    // --- Tests ---
-
-    #[test]
-    fn test_basic_map_chain() {
-        let mut app = setup_app();
-        let result_store = Arc::new(Mutex::new(None::<i32>));
-        app.insert_resource(TestResult(result_store.clone()));
-
-        let signal = Signal::from_system(|| Some(10))
-            .map(|In(v): In<i32>| Some(v * 2))
-            .map(|In(v): In<i32>, res: Res<TestResult<i32>>| {
-                res.set(v);
-                TERMINATE
-            });
-
-        let _handle = signal.register(&mut app.world);
-
-        app.update(); // Run process_signals
-
-        assert_eq!(result_store.lock().unwrap().take(), Some(20));
-    }
-
-    #[test]
-    fn test_from_component() {
-        let mut app = setup_app();
-        let result_store = Arc::new(Mutex::new(None::<i32>));
-        app.insert_resource(TestResult(result_store.clone()));
-
-        let entity = app.world.spawn(TestValue(5)).id();
-
-        let signal = Signal::from_component::<TestValue>(entity).map(
-            |In(v): In<TestValue>, res: Res<TestResult<i32>>| {
-                res.set(v.0);
-                TERMINATE
-            },
-        );
-
-        let _handle = signal.register(&mut app.world);
-
-        // Initial run - component exists but hasn't "changed" yet relative to signal start
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None);
-
-        // Modify the component
-        app.world
-            .entity_mut(entity)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 15;
-
-        // Run again - change should be detected
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), Some(15));
-
-        // Run again - no change
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None);
-    }
-
-    #[test]
-    fn test_from_resource() {
-        let mut app = setup_app();
-        let result_store = Arc::new(Mutex::new(None::<String>));
-        app.insert_resource(TestResult(result_store.clone()));
-        app.init_resource::<TestResource>();
-
-        let signal = Signal::from_resource::<TestResource>().map(
-            |In(v): In<TestResource>, res: Res<TestResult<String>>| {
-                res.set(v.0);
-                TERMINATE
-            },
-        );
-
-        let _handle = signal.register(&mut app.world);
-
-        // Initial run - resource exists but hasn't "changed" yet relative to signal start
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None);
-
-        // Modify the resource
-        app.world.resource_mut::<TestResource>().0 = "hello".to_string();
-
-        // Run again - change should be detected
-        app.update();
-        assert_eq!(
-            result_store.lock().unwrap().take(),
-            Some("hello".to_string())
-        );
-
-        // Run again - no change
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None);
-    }
-
-    #[test]
-    fn test_dedupe() {
-        let mut app = setup_app();
-        let result_store = Arc::new(Mutex::new(Vec::<i32>::new()));
-        app.insert_resource(TestVecResult(result_store.clone()));
-
-        let entity = app.world.spawn(TestValue(1)).id();
-
-        let signal = Signal::from_component::<TestValue>(entity)
-            .map(dedupe) // Add dedupe here
-            .map(|In(v): In<TestValue>, res: Res<TestVecResult<i32>>| {
-                res.push(v.0);
-                TERMINATE
-            });
-
-        let _handle = signal.register(&mut app.world);
-
-        // Initial change
-        app.world
-            .entity_mut(entity)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 10;
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), vec![10]);
-
-        // No change
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), vec![10]); // Should not run again
-
-        // Change again
-        app.world
-            .entity_mut(entity)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 20;
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20]);
-
-        // Change back
-        app.world
-            .entity_mut(entity)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 10;
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20, 10]);
-
-        // No change
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20, 10]); // Should not run again
-    }
-
-    #[test]
-    fn test_combine_with() {
-        let mut app = setup_app();
-        let result_store = Arc::new(Mutex::new(None::<(i32, String)>));
-        app.insert_resource(TestResult(result_store.clone()));
-        app.init_resource::<TestResource>(); // Source B
-
-        let entity_a = app.world.spawn(TestValue(0)).id(); // Source A
-
-        let signal_a = Signal::from_component::<TestValue>(entity_a).map(dedupe);
-        let signal_b = Signal::from_resource::<TestResource>().map(dedupe);
-
-        let combined = signal_a.combine_with(signal_b).map(
-            |In((a, b)): In<(TestValue, TestResource)>, res: Res<TestResult<(i32, String)>>| {
-                res.set((a.0, b.0));
-                TERMINATE
-            },
-        );
-
-        let _handle = combined.register(&mut app.world);
-
-        // 1. Initial state - nothing changed yet relative to signals
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None);
-
-        // 2. Change A
-        app.world
-            .entity_mut(entity_a)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 1;
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None); // B hasn't fired yet
-
-        // 3. Change B
-        app.world.resource_mut::<TestResource>().0 = "first".to_string();
-        app.update();
-        // Now both have fired, combine should trigger with (1, "first")
-        assert_eq!(
-            result_store.lock().unwrap().take(),
-            Some((1, "first".to_string()))
-        );
-
-        // 4. Change B again
-        app.world.resource_mut::<TestResource>().0 = "second".to_string();
-        app.update();
-        assert_eq!(result_store.lock().unwrap().take(), None); // A hasn't fired again yet
-
-        // 5. Change A again
-        app.world
-            .entity_mut(entity_a)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 2;
-        app.update();
-        // Combine should trigger with (2, "second") - uses latest B
-        assert_eq!(
-            result_store.lock().unwrap().take(),
-            Some((2, "second".to_string()))
-        );
-
-        // 6. Change A multiple times, then B
-        app.world
-            .entity_mut(entity_a)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 3;
-        app.update();
-        app.world
-            .entity_mut(entity_a)
-            .get_mut::<TestValue>()
-            .unwrap()
-            .0 = 4;
-        app.update();
-        app.world.resource_mut::<TestResource>().0 = "third".to_string();
-        app.update();
-        // Combine should trigger with latest A (4) and latest B ("third")
-        assert_eq!(
-            result_store.lock().unwrap().take(),
-            Some((4, "third".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_cleanup() {
-        let mut app = setup_app();
-        let result_store = Arc::new(Mutex::new(0)); // Count how many times the last system runs
-        app.insert_resource(TestCounterResult(result_store.clone()));
-
-        let signal =
-            Signal::from_system(|| Some(1)).map(|In(v): In<i32>, res: Res<TestCounterResult>| {
-                res.increment(v);
-                Some(v) // Pass through
-            });
-
-        let handle = signal.register(&mut app.world);
-        let system_entity = handle.0; // Get the entity ID
-
-        // Check system exists and runs
-        assert!(app.world.get_entity(system_entity).is_some());
-        assert!(app.world.get::<SystemRunner>(system_entity).is_some());
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), 1);
-
-        // Cleanup
-        handle.cleanup(&mut app.world);
-
-        // Check system entity is despawned
-        assert!(app.world.get_entity(system_entity).is_none());
-
-        // Check propagator no longer contains the node (requires access, tricky)
-        // We can indirectly test by seeing if the system runs again
-        app.update();
-        assert_eq!(result_store.lock().unwrap().clone(), 1); // Count should not increase
-
-        // Check trying to cleanup again doesn't panic
-        handle.cleanup(&mut app.world);
-    }
+/// Commonly used items for working with `jonmo` signals.
+///
+/// This prelude includes the core traits, structs, and functions needed to
+/// define and manage signal chains. It excludes internal implementation details
+/// like [`SignalBuilderInternal`].
+///
+/// ```
+/// use jonmo::prelude::*;
+/// ```
+pub mod prelude {
+    pub use crate::{
+        Combine, JonmoPlugin, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source,
+        TERMINATE, dedupe, entity_root,
+    };
+    // Note: SignalBuilderInternal is intentionally excluded
 }

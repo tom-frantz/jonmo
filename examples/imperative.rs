@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use jonmo::*;
+use jonmo::{mark_signal_root, pipe_signal, prelude::*, register_signal};
 
 fn main() {
     let mut app = App::new();

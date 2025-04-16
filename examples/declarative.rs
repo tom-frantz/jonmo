@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use jonmo::*;
+use jonmo::prelude::*;
 
 fn main() {
     let mut app = App::new();
@@ -34,7 +34,8 @@ fn setup_ui(world: &mut World) {
     // --- Signal Chain Setup (Declarative) ---
 
     // 1. Define the signal chain using the builder pattern.
-    let signal_chain = Signal::from_component::<Value>(entity) // Start signal from Value component changes on 'entity'
+    let signal = SignalBuilder::from_component::<Value>(entity) // Use Signals::from_component
+        .map(dedupe)
         .map(move |In(value): In<Value>, mut commands: Commands| {
             // Map the changed Value to a system that updates text
             // Update text by inserting the Text component
@@ -42,9 +43,12 @@ fn setup_ui(world: &mut World) {
             TERMINATE // Signal propagation stops after this system runs.
         });
 
+    // signal.combine_with(signal.clone());
+
     // 2. Register the entire chain with the world.
-    // This internally calls register_signal, mark_signal_root, and pipe_signal as needed.
-    let _handle = signal_chain.register(world);
+    // No need for disambiguation now, as SignalExt::register just defines the signature
+    // and the implementation comes from SignalBuilderInternal::register.
+    let _handle = signal.register(world); // Reverted to simple call
     // The handle can be stored if cleanup is needed later: handle.cleanup(world);
 }
 
