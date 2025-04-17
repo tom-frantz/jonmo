@@ -374,7 +374,7 @@ where
                         // Output is now Option<Vec<VecDiff<U>>>
 
                         let mut output_batch: Vec<VecDiff<U>> = Vec::new();
-                        
+
                         for diff_t in diff_batch {
                             let maybe_diff_u: Option<VecDiff<U>> = match diff_t {
                                 VecDiff::Replace { values } => {
@@ -524,7 +524,9 @@ where
                     .get_entity_mut(source_system_id_lock.get().copied().unwrap())
                     .ok()
                     .and_then(|mut entity: EntityWorldMut<'_>| {
-                        entity.get_mut::<QueuedVecDiffs<T>>().map(|mut x| x.0.drain(..).collect())
+                        entity
+                            .get_mut::<QueuedVecDiffs<T>>()
+                            .map(|mut x| x.0.drain(..).collect())
                     })
             }
         });

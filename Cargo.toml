@@ -11,23 +11,11 @@ repository = "https://github.com/databasedav/jonmo"
 documentation = "https://docs.rs/jonmo"
 
 [dependencies]
-<<<<<<< Updated upstream
-=======
-<<<<<<< Updated upstream
-=======
->>>>>>> Stashed changes
 bevy_ecs = "0.15.3"
 bevy_reflect = "0.15.3"
 bevy_log = "0.15.3"
 bevy_app = "0.15.3"
-<<<<<<< Updated upstream
 
 [dev-dependencies]
 bevy = "0.15.3"
-=======
-rand = "0.8" # Add rand dependency
-
-[dev-dependencies]
-bevy = "0.15.3"
->>>>>>> Stashed changes
->>>>>>> Stashed changes
+rand = "0.8"
