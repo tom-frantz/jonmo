@@ -75,6 +75,7 @@
 //! }
 //! ```
 
+<<<<<<< Updated upstream
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, system::SystemId};
 use bevy_log::prelude::*;
@@ -114,6 +115,11 @@ type MapRegisterFn = dyn Fn(
     + Send
     + Sync
     + 'static;
+=======
+<<<<<<< Updated upstream
+use std::{collections::{HashMap, HashSet}, marker::PhantomData, sync::Arc};
+use bevy::{ecs::system::SystemId, prelude::*, reflect::{GetTypeRegistration, PartialReflect, Typed}};
+>>>>>>> Stashed changes
 
 /// Creates a simple signal source system that always outputs the given `entity`.
 /// Useful as a starting point for signals related to a specific entity.
@@ -1034,6 +1040,24 @@ where
         SignalHandle(all_system_ids)
     }
 }
+=======
+use bevy_app::prelude::*;
+use bevy_ecs::prelude::*;
+// Declare modules
+mod signal;
+mod signal_vec;
+mod tree; // Add signal_vec module
+// mod mutable_vec; // Remove mutable_vec module
+
+// Publicly export items from modules
+pub use signal::*;
+pub use signal_vec::{
+    MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
+};
+pub use tree::{TERMINATE, dedupe, entity_root, mark_signal_root, pipe_signal, register_signal}; // Export SignalVec types
+
+use tree::SignalPropagator;
+>>>>>>> Stashed changes
 
 /// System that drives signal propagation by calling [`SignalPropagator::execute`].
 /// Added to the `Update` schedule by the [`JonmoPlugin`]. This system runs once per frame.
@@ -1071,6 +1095,314 @@ impl Plugin for JonmoPlugin {
     }
 }
 
+<<<<<<< Updated upstream
+=======
+<<<<<<< Updated upstream
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Import items from the library root
+    use std::sync::{Arc, Mutex};
+
+    // Helper component to track if a system ran
+    #[derive(Component, Default, Clone, Debug, PartialEq)]
+    struct Ran(bool);
+
+    // Helper component for component-based signals
+    #[derive(Component, Reflect, Clone, Default, PartialEq, Debug)]
+    #[reflect(Component)]
+    struct TestValue(i32);
+
+    // Helper resource for resource-based signals
+    #[derive(Resource, Reflect, Clone, Default, PartialEq, Debug)]
+    #[reflect(Resource)]
+    struct TestResource(String);
+
+    // Helper resource to store results for assertions
+    #[derive(Resource, Default)]
+    struct TestResult<T: Send + Sync + 'static>(Arc<Mutex<Option<T>>>);
+
+    impl<T: Send + Sync + 'static> TestResult<T> {
+        fn set(&self, value: T) {
+            *self.0.lock().unwrap() = Some(value);
+        }
+        // fn get(&self) -> Option<T> // Not used in current tests
+        // where
+        //     T: Clone,
+        // {
+        //     self.0.lock().unwrap().clone()
+        // }
+        fn take(&self) -> Option<T> {
+            self.0.lock().unwrap().take()
+        }
+    }
+
+    // Helper resource to store vec results for assertions
+    #[derive(Resource, Default)]
+    struct TestVecResult<T: Send + Sync + 'static>(Arc<Mutex<Vec<T>>>);
+
+    impl<T: Send + Sync + 'static> TestVecResult<T> {
+        fn push(&self, value: T) {
+            self.0.lock().unwrap().push(value);
+        }
+        fn get_cloned(&self) -> Vec<T>
+        where
+            T: Clone,
+        {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    // Helper resource to store counter results for assertions
+    #[derive(Resource, Default)]
+    struct TestCounterResult(Arc<Mutex<i32>>);
+
+    impl TestCounterResult {
+        fn increment(&self, value: i32) {
+            *self.0.lock().unwrap() += value;
+        }
+        fn get(&self) -> i32 {
+            *self.0.lock().unwrap()
+        }
+    }
+
+
+    // --- Test Setup ---
+
+    fn setup_app() -> App {
+        let mut app = App::new();
+        // Use MinimalPlugins for lighter testing if DefaultPlugins are too heavy
+        // app.add_plugins(MinimalPlugins);
+        app.add_plugins(JonmoPlugin);
+        // Register types needed for tests
+        app.register_type::<TestValue>();
+        app.register_type::<TestResource>();
+        app
+    }
+
+    // --- Tests ---
+
+    #[test]
+    fn test_basic_map_chain() {
+        let mut app = setup_app();
+        let result_store = Arc::new(Mutex::new(None::<i32>));
+        app.insert_resource(TestResult(result_store.clone()));
+
+        let signal = Signal::from_system(|| Some(10))
+            .map(|In(v): In<i32>| Some(v * 2))
+            .map(|In(v): In<i32>, res: Res<TestResult<i32>>| {
+                res.set(v);
+                TERMINATE
+            });
+
+        let _handle = signal.register(&mut app.world);
+
+        app.update(); // Run process_signals
+
+        assert_eq!(result_store.lock().unwrap().take(), Some(20));
+    }
+
+    #[test]
+    fn test_from_component() {
+        let mut app = setup_app();
+        let result_store = Arc::new(Mutex::new(None::<i32>));
+        app.insert_resource(TestResult(result_store.clone()));
+
+        let entity = app.world.spawn(TestValue(5)).id();
+
+        let signal = Signal::from_component::<TestValue>(entity)
+            .map(|In(v): In<TestValue>, res: Res<TestResult<i32>>| {
+                res.set(v.0);
+                TERMINATE
+            });
+
+        let _handle = signal.register(&mut app.world);
+
+        // Initial run - component exists but hasn't "changed" yet relative to signal start
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None);
+
+        // Modify the component
+        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 15;
+
+        // Run again - change should be detected
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), Some(15));
+
+        // Run again - no change
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None);
+    }
+
+    #[test]
+    fn test_from_resource() {
+        let mut app = setup_app();
+        let result_store = Arc::new(Mutex::new(None::<String>));
+        app.insert_resource(TestResult(result_store.clone()));
+        app.init_resource::<TestResource>();
+
+        let signal = Signal::from_resource::<TestResource>()
+            .map(|In(v): In<TestResource>, res: Res<TestResult<String>>| {
+                res.set(v.0);
+                TERMINATE
+            });
+
+        let _handle = signal.register(&mut app.world);
+
+        // Initial run - resource exists but hasn't "changed" yet relative to signal start
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None);
+
+        // Modify the resource
+        app.world.resource_mut::<TestResource>().0 = "hello".to_string();
+
+        // Run again - change should be detected
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), Some("hello".to_string()));
+
+        // Run again - no change
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None);
+    }
+
+    #[test]
+    fn test_dedupe() {
+        let mut app = setup_app();
+        let result_store = Arc::new(Mutex::new(Vec::<i32>::new()));
+        app.insert_resource(TestVecResult(result_store.clone()));
+
+        let entity = app.world.spawn(TestValue(1)).id();
+
+        let signal = Signal::from_component::<TestValue>(entity)
+            .map(dedupe) // Add dedupe here
+            .map(|In(v): In<TestValue>, res: Res<TestVecResult<i32>>| {
+                res.push(v.0);
+                TERMINATE
+            });
+
+        let _handle = signal.register(&mut app.world);
+
+        // Initial change
+        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 10;
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), vec![10]);
+
+        // No change
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), vec![10]); // Should not run again
+
+        // Change again
+        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 20;
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20]);
+
+        // Change back
+        app.world.entity_mut(entity).get_mut::<TestValue>().unwrap().0 = 10;
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20, 10]);
+
+        // No change
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), vec![10, 20, 10]); // Should not run again
+    }
+
+
+    #[test]
+    fn test_combine_with() {
+        let mut app = setup_app();
+        let result_store = Arc::new(Mutex::new(None::<(i32, String)>));
+        app.insert_resource(TestResult(result_store.clone()));
+        app.init_resource::<TestResource>(); // Source B
+
+        let entity_a = app.world.spawn(TestValue(0)).id(); // Source A
+
+        let signal_a = Signal::from_component::<TestValue>(entity_a).map(dedupe);
+        let signal_b = Signal::from_resource::<TestResource>().map(dedupe);
+
+        let combined = signal_a
+            .combine_with(signal_b)
+            .map(|In((a, b)): In<(TestValue, TestResource)>, res: Res<TestResult<(i32, String)>>| {
+                res.set((a.0, b.0));
+                TERMINATE
+            });
+
+        let _handle = combined.register(&mut app.world);
+
+        // 1. Initial state - nothing changed yet relative to signals
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None);
+
+        // 2. Change A
+        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 1;
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None); // B hasn't fired yet
+
+        // 3. Change B
+        app.world.resource_mut::<TestResource>().0 = "first".to_string();
+        app.update();
+        // Now both have fired, combine should trigger with (1, "first")
+        assert_eq!(result_store.lock().unwrap().take(), Some((1, "first".to_string())));
+
+        // 4. Change B again
+        app.world.resource_mut::<TestResource>().0 = "second".to_string();
+        app.update();
+        assert_eq!(result_store.lock().unwrap().take(), None); // A hasn't fired again yet
+
+        // 5. Change A again
+        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 2;
+        app.update();
+        // Combine should trigger with (2, "second") - uses latest B
+        assert_eq!(result_store.lock().unwrap().take(), Some((2, "second".to_string())));
+
+        // 6. Change A multiple times, then B
+        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 3;
+        app.update();
+        app.world.entity_mut(entity_a).get_mut::<TestValue>().unwrap().0 = 4;
+        app.update();
+        app.world.resource_mut::<TestResource>().0 = "third".to_string();
+        app.update();
+        // Combine should trigger with latest A (4) and latest B ("third")
+        assert_eq!(result_store.lock().unwrap().take(), Some((4, "third".to_string())));
+    }
+
+
+    #[test]
+    fn test_cleanup() {
+        let mut app = setup_app();
+        let result_store = Arc::new(Mutex::new(0)); // Count how many times the last system runs
+        app.insert_resource(TestCounterResult(result_store.clone()));
+
+        let signal = Signal::from_system(|| Some(1))
+            .map(|In(v): In<i32>, res: Res<TestCounterResult>| {
+                res.increment(v);
+                Some(v) // Pass through
+            });
+
+        let handle = signal.register(&mut app.world);
+        let system_entity = handle.0; // Get the entity ID
+
+        // Check system exists and runs
+        assert!(app.world.get_entity(system_entity).is_some());
+        assert!(app.world.get::<SystemRunner>(system_entity).is_some());
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), 1);
+
+        // Cleanup
+        handle.cleanup(&mut app.world);
+
+        // Check system entity is despawned
+        assert!(app.world.get_entity(system_entity).is_none());
+
+        // Check propagator no longer contains the node (requires access, tricky)
+        // We can indirectly test by seeing if the system runs again
+        app.update();
+        assert_eq!(result_store.lock().unwrap().clone(), 1); // Count should not increase
+
+        // Check trying to cleanup again doesn't panic
+        handle.cleanup(&mut app.world);
+    }
+=======
+>>>>>>> Stashed changes
 /// Commonly used items for working with `jonmo` signals.
 ///
 /// This prelude includes the core traits, structs, and functions needed to
@@ -1082,8 +1414,29 @@ impl Plugin for JonmoPlugin {
 /// ```
 pub mod prelude {
     pub use crate::{
+<<<<<<< Updated upstream
         Combine, JonmoPlugin, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source,
         TERMINATE, dedupe, entity_root,
     };
     // Note: SignalBuilderInternal is intentionally excluded
+=======
+        JonmoPlugin,
+        signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
+        signal_vec::{
+            MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
+        }, // Add SignalVec to prelude
+        tree::{TERMINATE, dedupe, entity_root},
+    };
+    // Note: SignalBuilderInternal is intentionally excluded
+    // Note: Imperative functions like register_signal, pipe_signal, mark_signal_root are also excluded from prelude
+}
+
+/// A generic identity system that takes an input `T` and returns `Some(T)`.
+/// Useful for signal graph nodes that just pass through data.
+///
+/// Typically used with `In<T>` for Bevy system parameters.
+pub fn identity<T: Send + Sync + 'static>(In(input): In<T>) -> Option<T> {
+    Some(input)
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
 }
