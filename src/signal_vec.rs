@@ -152,54 +152,47 @@ where
 
 // Removed unused identity_batch_system function
 
-/// Internal trait handling the registration logic for `SignalVec` nodes.
-pub trait SignalVecBuilderInternal: Send + Sync + 'static {
-    /// The type of items in the vector.
-    type Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static; // Removed PartialEq
+// --- Consolidated SignalVec Trait ---
 
-    /// Registers the systems associated with this node and its predecessors.
-    fn register(&self, world: &mut World) -> Vec<UntypedSystemId>;
-}
-
-/// Represents a `Vec` that changes over time.
+/// Represents a `Vec` that changes over time, yielding [`VecDiff<T>`] and handling registration.
 ///
 /// Instead of yielding the entire `Vec` with each change, it yields [`VecDiff<T>`]
-/// describing the change.
+/// describing the change. This trait combines the public concept with internal registration.
 pub trait SignalVec: Send + Sync + 'static {
     /// The type of items in the vector.
-    type Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static; // Removed PartialEq
+    type Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static;
+
+    /// Registers the systems associated with this node and its predecessors in the `World`.
+    /// Returns a [`SignalHandle`] containing the entities of *all* systems
+    /// registered or reference-counted during this specific registration call instance.
+    /// **Note:** This method is intended for internal use by the signal combinators and registration process.
+    fn register(&self, world: &mut World) -> SignalHandle;
 }
 
 /// A source node for a `SignalVec` chain. Holds the entity ID of the registered source system.
 #[derive(Clone)] // Clone is fine, just copies the Entity ID
 pub struct SourceVec<T>
 where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     /// The entity ID of the Bevy system that acts as the source for this signal.
     pub(crate) entity: Entity,
     _marker: PhantomData<T>,
 }
 
-impl<T> SignalVecBuilderInternal for SourceVec<T>
+// Implement SignalVec for SourceVec<T>
+impl<T> SignalVec for SourceVec<T>
 where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     type Item = T;
 
     /// Registers the systems associated with this node. For a SourceVec, it's already registered.
-    fn register(&self, _world: &mut World) -> Vec<UntypedSystemId> {
+    fn register(&self, _world: &mut World) -> SignalHandle {
         // The system is already registered (e.g., by MutableVec::signal_vec or SignalVecBuilder::from_system)
-        // We just need to return its entity ID.
-        vec![self.entity]
+        // We just need to return its entity ID wrapped in a handle.
+        SignalHandle::new(vec![self.entity]) // Return SignalHandle
     }
-}
-
-impl<T> SignalVec for SourceVec<T>
-where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-{
-    type Item = T;
 }
 
 type MapVecRegisterFn = dyn Fn(
@@ -213,10 +206,10 @@ type MapVecRegisterFn = dyn Fn(
 /// A map node in a `SignalVec` chain.
 pub struct MapVec<Prev, U>
 where
-    Prev: SignalVecBuilderInternal,
-    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-    <Prev as SignalVecBuilderInternal>::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+    Prev: SignalVec, // Use consolidated SignalVec trait
+    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    <Prev as SignalVec>::Item:
+        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     pub(crate) prev_signal: Prev,
     pub(crate) register_fn: Arc<MapVecRegisterFn>,
@@ -225,10 +218,10 @@ where
 
 impl<Prev, U> Clone for MapVec<Prev, U>
 where
-    Prev: SignalVecBuilderInternal + Clone,
-    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-    <Prev as SignalVecBuilderInternal>::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+    Prev: SignalVec + Clone, // Use consolidated SignalVec trait
+    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    <Prev as SignalVec>::Item:
+        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -239,36 +232,28 @@ where
     }
 }
 
-impl<Prev, U> SignalVecBuilderInternal for MapVec<Prev, U>
+// Implement SignalVec for MapVec<Prev, U>
+impl<Prev, U> SignalVec for MapVec<Prev, U>
 where
-    Prev: SignalVecBuilderInternal,
-    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-    <Prev as SignalVecBuilderInternal>::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+    Prev: SignalVec, // Use consolidated SignalVec trait
+    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    <Prev as SignalVec>::Item:
+        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     type Item = U;
 
-    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
-        let mut prev_ids = self.prev_signal.register(world);
-        if let Some(&prev_last_id_entity) = prev_ids.last() {
+    fn register(&self, world: &mut World) -> SignalHandle {
+        let prev_handle = self.prev_signal.register(world); // Returns SignalHandle
+        let mut all_ids = prev_handle.system_ids().to_vec(); // Get Vec<UntypedSystemId>
+
+        if let Some(&prev_last_id_entity) = all_ids.last() {
             let new_system_entity = (self.register_fn)(world, prev_last_id_entity);
-            prev_ids.push(new_system_entity);
+            all_ids.push(new_system_entity);
         } else {
             bevy_log::error!("MapVec signal parent registration returned empty ID list.");
         }
-        prev_ids
+        SignalHandle::new(all_ids) // Return new SignalHandle with all IDs
     }
-}
-
-impl<Prev, U> SignalVec for MapVec<Prev, U>
-where
-    Prev: SignalVecBuilderInternal,
-    U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-    <Prev as SignalVecBuilderInternal>::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-    Prev: SignalVec<Item = <Prev as SignalVecBuilderInternal>::Item>,
-{
-    type Item = U;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -297,8 +282,8 @@ where
     None // Always returns None
 }
 
-/// Extension trait providing combinator methods for types implementing [`SignalVec`].
-pub trait SignalVecExt: SignalVec + SignalVecBuilderInternal + Clone {
+/// Extension trait providing combinator methods for types implementing [`SignalVec`] and [`Clone`].
+pub trait SignalVecExt: SignalVec + Clone { // Use consolidated SignalVec trait
     /// Creates a new `SignalVec` which maps the items within the output diffs of this `SignalVec`
     /// using the given Bevy system `F: IntoSystem<In<Self::Item>, Option<U>, M>`.
     ///
@@ -313,8 +298,8 @@ pub trait SignalVecExt: SignalVec + SignalVecBuilderInternal + Clone {
     where
         Self: Sized,
         <Self as SignalVec>::Item:
-            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-        U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         F: IntoSystem<In<<Self as SignalVec>::Item>, Option<U>, M>
             // F takes In<T>, returns Option<U>
             + Send
@@ -333,14 +318,14 @@ pub trait SignalVecExt: SignalVec + SignalVecBuilderInternal + Clone {
 
 impl<T> SignalVecExt for T
 where
-    T: SignalVec + SignalVecBuilderInternal<Item = <T as SignalVec>::Item> + Clone,
+    T: SignalVec + Clone, // Use consolidated SignalVec trait
 {
     fn map<U, M, F>(self, system: F) -> MapVec<Self, U>
     // F is IntoSystem
     where
         <T as SignalVec>::Item:
-            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
-        U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static, // Removed PartialEq
+            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         F: IntoSystem<In<<T as SignalVec>::Item>, Option<U>, M> // F takes In<T>, returns Option<U>
             + Send
             + Sync
@@ -368,11 +353,10 @@ where
                 // 3. Define and register the wrapper system.
                 //    Input is Vec<VecDiff<T::Item>>, Output is Option<Vec<VecDiff<U>>>.
                 let wrapper_system =
-                    move |In(diff_batch): In<Vec<VecDiff<<T as SignalVec>::Item>>>,
+                    move |In(diff_batch): In<Vec<VecDiff<<T as SignalVec>::Item>>>, // Use SignalVec::Item
                           world: &mut World|
                           -> Option<Vec<VecDiff<U>>> {
-                        // Output is now Option<Vec<VecDiff<U>>>
-
+                        // ... (internal logic of wrapper system unchanged) ...
                         let mut output_batch: Vec<VecDiff<U>> = Vec::new();
 
                         for diff_t in diff_batch {
@@ -449,7 +433,6 @@ where
 
                 // 4. Pipe the signals together in the desired chain.
                 pipe_signal(world, prev_last_id_entity, wrapper_entity); // Previous -> Wrapper
-                // we do this to tie the lifetime of the map system to the signal vec wrapper, avoiding extra infrastructure for cleaning up this signal
                 pipe_signal(world, wrapper_entity, terminator_entity); // Wrapper -> Terminator
                 pipe_signal(world, terminator_entity, user_entity); // Terminator -> User System F's Entity
 
@@ -466,8 +449,8 @@ where
     }
 
     fn register(&self, world: &mut World) -> SignalHandle {
-        let all_system_ids = <T as SignalVecBuilderInternal>::register(self, world);
-        SignalHandle::new(all_system_ids) // Use constructor
+        // Directly call the register method from the consolidated SignalVec trait
+        <T as SignalVec>::register(self, world)
     }
 }
 

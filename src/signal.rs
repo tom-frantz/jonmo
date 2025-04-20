@@ -31,27 +31,26 @@ type MapRegisterFn = dyn Fn(
     + Sync
     + 'static;
 
-/// Internal trait handling the registration logic for different signal node types.
-/// **Note:** This trait is intended for internal use only.
-pub trait SignalBuilderInternal: Send + Sync + 'static {
-    /// The logical output type of this signal node.
-    type Item: Send + Sync + 'static;
+// --- Consolidated Signal Trait ---
 
-    /// Registers the systems associated with this node and its predecessors in the `World`.
-    /// Returns a `Vec<UntypedSystemId>` containing the entities of *all* systems
-    /// registered or reference-counted during this specific registration call instance.
-    fn register(&self, world: &mut World) -> Vec<UntypedSystemId>;
-}
-
-/// Represents a value that changes over time.
+/// Represents a value that changes over time and handles internal registration logic.
 ///
 /// Signals are the core building block for reactive data flow. They are typically
 /// created using methods on the [`SignalBuilder`] struct (e.g., [`SignalBuilder::from_component`])
 /// and then transformed or combined using methods from the [`SignalExt`] trait.
+/// This trait combines the public concept of a signal with its internal registration mechanism.
 pub trait Signal: Send + Sync + 'static {
     /// The type of value produced by this signal.
     type Item: Send + Sync + 'static;
+
+    /// Registers the systems associated with this node and its predecessors in the `World`.
+    /// Returns a [`SignalHandle`] containing the entities of *all* systems
+    /// registered or reference-counted during this specific registration call instance.
+    /// **Note:** This method is intended for internal use by the signal combinators and registration process.
+    fn register(&self, world: &mut World) -> SignalHandle; // Changed return type
 }
+
+// --- Signal Node Structs ---
 
 /// Struct representing a source node in the signal chain definition. Implements [`Signal`].
 #[derive(Clone)]
@@ -64,34 +63,26 @@ where
     _marker: PhantomData<O>,
 }
 
-// Implement internal registration logic
-impl<O> SignalBuilderInternal for Source<O>
-where
-    O: Send + Sync + 'static,
-{
-    type Item = O;
-
-    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
-        let system_id = (self.register_fn)(world);
-        vec![system_id.entity()]
-    }
-}
-
-// Implement the public Signal trait
+// Implement Signal for Source<O>
 impl<O> Signal for Source<O>
 where
     O: Send + Sync + 'static,
 {
     type Item = O;
+
+    fn register(&self, world: &mut World) -> SignalHandle { // Changed return type
+        let system_id = (self.register_fn)(world);
+        SignalHandle::new(vec![system_id.entity()]) // Wrap in SignalHandle
+    }
 }
 
 /// Struct representing a map node in the signal chain definition. Implements [`Signal`].
 /// Generic only over the previous signal (`Prev`) and the output type (`U`).
 pub struct Map<Prev, U>
 where
-    Prev: SignalBuilderInternal,
+    Prev: Signal, // Use the consolidated Signal trait
     U: Send + Sync + 'static,
-    <Prev as SignalBuilderInternal>::Item: Send + Sync + 'static,
+    <Prev as Signal>::Item: Send + Sync + 'static,
 {
     pub(crate) prev_signal: Prev,
     pub(crate) register_fn: Arc<MapRegisterFn>,
@@ -101,9 +92,9 @@ where
 // Add Clone implementation for Map
 impl<Prev, U> Clone for Map<Prev, U>
 where
-    Prev: SignalBuilderInternal + Clone,
+    Prev: Signal + Clone, // Use the consolidated Signal trait
     U: Send + Sync + 'static,
-    <Prev as SignalBuilderInternal>::Item: Send + Sync + 'static,
+    <Prev as Signal>::Item: Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -114,43 +105,34 @@ where
     }
 }
 
-// Implement internal registration logic for Map<Prev, U>
-impl<Prev, U> SignalBuilderInternal for Map<Prev, U>
+// Implement Signal for Map<Prev, U>
+impl<Prev, U> Signal for Map<Prev, U>
 where
-    Prev: SignalBuilderInternal,
+    Prev: Signal, // Use the consolidated Signal trait
     U: FromReflect + Send + Sync + 'static,
-    <Prev as SignalBuilderInternal>::Item: FromReflect + Send + Sync + 'static,
+    <Prev as Signal>::Item: FromReflect + Send + Sync + 'static,
 {
     type Item = U;
 
-    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
-        let mut prev_ids = self.prev_signal.register(world);
-        if let Some(&prev_last_id_entity) = prev_ids.last() {
+    fn register(&self, world: &mut World) -> SignalHandle { // Changed return type
+        let prev_handle = self.prev_signal.register(world); // Returns SignalHandle
+        let mut all_ids = prev_handle.system_ids().to_vec(); // Get Vec<UntypedSystemId>
+
+        if let Some(&prev_last_id_entity) = all_ids.last() {
             let new_system_entity = (self.register_fn)(world, prev_last_id_entity);
-            prev_ids.push(new_system_entity);
+            all_ids.push(new_system_entity);
         } else {
             error!("Map signal parent registration returned empty ID list.");
         }
-        prev_ids
+        SignalHandle::new(all_ids) // Wrap in SignalHandle
     }
-}
-
-// Implement the public Signal trait for Map<Prev, U>
-impl<Prev, U> Signal for Map<Prev, U>
-where
-    Prev: SignalBuilderInternal,
-    U: Send + Sync + 'static,
-    <Prev as SignalBuilderInternal>::Item: Send + Sync + 'static,
-    Prev: Signal<Item = <Prev as SignalBuilderInternal>::Item>,
-{
-    type Item = U;
 }
 
 /// Struct representing a combine node in the signal chain definition. Implements [`Signal`].
 pub struct Combine<Left, Right>
 where
-    Left: Signal + SignalBuilderInternal,
-    Right: Signal + SignalBuilderInternal,
+    Left: Signal, // Use the consolidated Signal trait
+    Right: Signal, // Use the consolidated Signal trait
     <Left as Signal>::Item: Send + Sync + 'static,
     <Right as Signal>::Item: Send + Sync + 'static,
 {
@@ -163,8 +145,8 @@ where
 // Add Clone implementation for Combine
 impl<Left, Right> Clone for Combine<Left, Right>
 where
-    Left: Signal + SignalBuilderInternal + Clone,
-    Right: Signal + SignalBuilderInternal + Clone,
+    Left: Signal + Clone, // Use the consolidated Signal trait
+    Right: Signal + Clone, // Use the consolidated Signal trait
     <Left as Signal>::Item: Send + Sync + 'static,
     <Right as Signal>::Item: Send + Sync + 'static,
     Arc<CombineRegisterFn<<Left as Signal>::Item, <Right as Signal>::Item>>: Clone,
@@ -179,19 +161,22 @@ where
     }
 }
 
-// Implement internal registration logic
-impl<Left, Right> SignalBuilderInternal for Combine<Left, Right>
+// Implement Signal for Combine<Left, Right>
+impl<Left, Right> Signal for Combine<Left, Right>
 where
-    Left: Signal + SignalBuilderInternal,
-    Right: Signal + SignalBuilderInternal,
+    Left: Signal, // Use the consolidated Signal trait
+    Right: Signal, // Use the consolidated Signal trait
     <Left as Signal>::Item: Send + Sync + 'static,
     <Right as Signal>::Item: Send + Sync + 'static,
 {
     type Item = (<Left as Signal>::Item, <Right as Signal>::Item);
 
-    fn register(&self, world: &mut World) -> Vec<UntypedSystemId> {
-        let mut left_ids = self.left_signal.register(world);
-        let mut right_ids = self.right_signal.register(world);
+    fn register(&self, world: &mut World) -> SignalHandle { // Changed return type
+        let left_handle = self.left_signal.register(world); // Returns SignalHandle
+        let right_handle = self.right_signal.register(world); // Returns SignalHandle
+
+        let mut left_ids = left_handle.system_ids().to_vec();
+        let mut right_ids = right_handle.system_ids().to_vec();
 
         let combined_ids = if let (Some(&left_last_id), Some(&right_last_id)) =
             (left_ids.last(), right_ids.last())
@@ -206,19 +191,8 @@ where
 
         left_ids.append(&mut right_ids);
         left_ids.extend(combined_ids);
-        left_ids
+        SignalHandle::new(left_ids) // Wrap in SignalHandle
     }
-}
-
-// Implement the public Signal trait
-impl<Left, Right> Signal for Combine<Left, Right>
-where
-    Left: Signal + SignalBuilderInternal,
-    Right: Signal + SignalBuilderInternal,
-    <Left as Signal>::Item: Send + Sync + 'static,
-    <Right as Signal>::Item: Send + Sync + 'static,
-{
-    type Item = (<Left as Signal>::Item, <Right as Signal>::Item);
 }
 
 /// Handle returned by [`SignalExt::register`] used for cleaning up the registered signal chain.
@@ -234,6 +208,11 @@ impl SignalHandle {
     /// This is crate-public to allow construction from other modules.
     pub(crate) fn new(ids: Vec<UntypedSystemId>) -> Self {
         Self(ids)
+    }
+
+    /// Returns a slice containing the system IDs managed by this handle.
+    pub(crate) fn system_ids(&self) -> &[UntypedSystemId] {
+        &self.0
     }
 
     /// Decrements the reference count for each system associated with this handle.
@@ -357,9 +336,8 @@ impl SignalBuilder {
     }
 }
 
-/// Extension trait providing combinator methods for types implementing [`Signal`],
-/// [`SignalBuilderInternal`], and [`Clone`].
-pub trait SignalExt: Signal + SignalBuilderInternal + Clone {
+/// Extension trait providing combinator methods for types implementing [`Signal`] and [`Clone`].
+pub trait SignalExt: Signal + Clone { // Remove SignalBuilderInternal bound
     /// Appends a transformation step to the signal chain using a Bevy system.
     ///
     /// The provided `system` takes the output `Item` of the previous step (wrapped in `In<Item>`)
@@ -371,12 +349,12 @@ pub trait SignalExt: Signal + SignalBuilderInternal + Clone {
     fn map<U, M, F>(self, system: F) -> Map<Self, U>
     where
         Self: Sized,
-        <Self as SignalBuilderInternal>::Item: FromReflect + Send + Sync + 'static,
+        <Self as Signal>::Item: FromReflect + Send + Sync + 'static, // Use Signal::Item
         U: FromReflect + Send + Sync + 'static,
-        F: IntoSystem<In<<Self as SignalBuilderInternal>::Item>, Option<U>, M>
+        F: IntoSystem<In<<Self as Signal>::Item>, Option<U>, M> // Use Signal::Item
             + Send
             + Sync
-            + Clone // <-- Re-added Clone bound
+            + Clone
             + 'static,
         M: Send + Sync + 'static;
 
@@ -390,7 +368,7 @@ pub trait SignalExt: Signal + SignalBuilderInternal + Clone {
     fn combine_with<S2>(self, other: S2) -> Combine<Self, S2>
     where
         Self: Sized,
-        S2: Signal + SignalBuilderInternal + Clone,
+        S2: Signal + Clone, // Use Signal + Clone
         <Self as Signal>::Item: FromReflect
             + GetTypeRegistration
             + Typed
@@ -411,7 +389,7 @@ pub trait SignalExt: Signal + SignalBuilderInternal + Clone {
     /// Registers all the systems defined in this signal chain into the Bevy `World`.
     ///
     /// This activates the signal chain. It traverses the internal representation (calling
-    /// [`SignalBuilderInternal::register`] recursively), registers each required Bevy system
+    /// [`Signal::register`] recursively), registers each required Bevy system
     /// (or increments its reference count if already registered), connects them in the
     /// [`SignalPropagator`], and marks the source system(s) as roots.
     ///
@@ -420,32 +398,30 @@ pub trait SignalExt: Signal + SignalBuilderInternal + Clone {
     fn register(&self, world: &mut World) -> SignalHandle;
 }
 
-// Implement SignalExt for any type T that implements Signal + SignalBuilderInternal + Clone
+// Implement SignalExt for any type T that implements Signal + Clone
 impl<T> SignalExt for T
 where
-    T: Signal + SignalBuilderInternal<Item = <T as Signal>::Item> + Clone,
+    T: Signal + Clone, // Update bounds
 {
     fn map<U, M, F>(self, system: F) -> Map<Self, U>
     where
-        <T as SignalBuilderInternal>::Item: Send + Sync + 'static,
-        <T as SignalBuilderInternal>::Item: FromReflect + Send + Sync + 'static,
+        <T as Signal>::Item: Send + Sync + 'static, // Use Signal::Item
+        <T as Signal>::Item: FromReflect + Send + Sync + 'static, // Use Signal::Item
         U: FromReflect + Send + Sync + 'static,
-        F: IntoSystem<In<<T as SignalBuilderInternal>::Item>, Option<U>, M>
+        F: IntoSystem<In<<T as Signal>::Item>, Option<U>, M> // Use Signal::Item
             + Send
             + Sync
-            + Clone // <-- Re-added Clone bound
+            + Clone
             + 'static,
         M: Send + Sync + 'static,
     {
-        let system_clone = system.clone(); // <-- Clone the system here
+        let system_clone = system.clone();
 
         let register_fn = Arc::new(
-            // Closure doesn't need to be move anymore
             move |world: &mut World, prev_last_id_entity: UntypedSystemId| -> UntypedSystemId {
-                // Clone the system again for registration
-                let system_id = register_signal::<<T as SignalBuilderInternal>::Item, U, M>(
+                let system_id = register_signal::<<T as Signal>::Item, U, M>( // Use Signal::Item
                     world,
-                    system_clone.clone(), // Pass the cloned system
+                    system_clone.clone(),
                 );
                 let system_entity = system_id.entity();
 
@@ -464,7 +440,7 @@ where
 
     fn combine_with<S2>(self, other: S2) -> Combine<Self, S2>
     where
-        S2: Signal + SignalBuilderInternal + Clone,
+        S2: Signal + Clone, // Update bounds
         <Self as Signal>::Item: FromReflect
             + GetTypeRegistration
             + Typed
@@ -485,7 +461,7 @@ where
         let register_fn = move |world: &mut World,
                                 left_id_entity: UntypedSystemId,
                                 right_id_entity: UntypedSystemId| {
-            combine_signal::<<Self as Signal>::Item, <S2 as Signal>::Item>(
+            combine_signal::<<Self as Signal>::Item, <S2 as Signal>::Item>( // Use Signal::Item
                 world,
                 left_id_entity,
                 right_id_entity,
@@ -496,13 +472,13 @@ where
             left_signal: self,
             right_signal: other,
             register_fn: Arc::new(register_fn)
-                as Arc<CombineRegisterFn<<Self as Signal>::Item, <S2 as Signal>::Item>>,
+                as Arc<CombineRegisterFn<<Self as Signal>::Item, <S2 as Signal>::Item>>, // Use Signal::Item
             _marker: PhantomData,
         }
     }
 
     fn register(&self, world: &mut World) -> SignalHandle {
-        let all_system_ids = <T as SignalBuilderInternal>::register(self, world);
-        SignalHandle(all_system_ids)
+        // <T as Signal>::register now returns SignalHandle directly
+        <T as Signal>::register(self, world)
     }
 }

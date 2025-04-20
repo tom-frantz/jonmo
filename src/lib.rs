@@ -81,6 +81,7 @@ use bevy_ecs::prelude::*;
 mod signal;
 mod signal_vec;
 mod tree; // Add signal_vec module
+mod node_builder;
 // mod mutable_vec; // Remove mutable_vec module
 
 // Publicly export items from modules
@@ -145,6 +146,7 @@ pub mod prelude {
             MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
         }, // Add SignalVec to prelude
         tree::{TERMINATE, dedupe, entity_root},
+        node_builder::*,
     };
     // Note: SignalBuilderInternal is intentionally excluded
     // Note: Imperative functions like register_signal, pipe_signal, mark_signal_root are also excluded from prelude
