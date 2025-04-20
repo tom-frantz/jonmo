@@ -78,10 +78,10 @@
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 // Declare modules
+mod node_builder;
 mod signal;
 mod signal_vec;
 mod tree; // Add signal_vec module
-mod node_builder;
 // mod mutable_vec; // Remove mutable_vec module
 
 // Publicly export items from modules
@@ -91,7 +91,7 @@ pub use signal_vec::{
 };
 pub use tree::{mark_signal_root, pipe_signal, register_signal}; // Export SignalVec types
 
-use tree::SignalPropagator;
+use tree::{consume_mark_signal_root, consume_pipe_signal, MarkSignalRoot, PipeSignal, SignalPropagator};
 
 /// System that drives signal propagation by calling [`SignalPropagator::execute`].
 /// Added to the `Update` schedule by the [`JonmoPlugin`]. This system runs once per frame.
@@ -124,8 +124,12 @@ pub struct JonmoPlugin;
 
 impl Plugin for JonmoPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, process_signals)
-            .init_resource::<SignalPropagator>();
+        app
+        .init_resource::<SignalPropagator>()
+        .add_event::<MarkSignalRoot>()
+        .add_event::<PipeSignal>()
+        .add_systems(First, (consume_mark_signal_root, consume_pipe_signal).run_if(resource_exists::<SignalPropagator>))
+        .add_systems(Last, process_signals);
     }
 }
 
@@ -141,12 +145,12 @@ impl Plugin for JonmoPlugin {
 pub mod prelude {
     pub use crate::{
         JonmoPlugin,
+        node_builder::*,
         signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
         signal_vec::{
             MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
         }, // Add SignalVec to prelude
         tree::{TERMINATE, dedupe, entity_root},
-        node_builder::*,
     };
     // Note: SignalBuilderInternal is intentionally excluded
     // Note: Imperative functions like register_signal, pipe_signal, mark_signal_root are also excluded from prelude

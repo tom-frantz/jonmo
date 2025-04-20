@@ -39,7 +39,7 @@ type MapRegisterFn = dyn Fn(
 /// created using methods on the [`SignalBuilder`] struct (e.g., [`SignalBuilder::from_component`])
 /// and then transformed or combined using methods from the [`SignalExt`] trait.
 /// This trait combines the public concept of a signal with its internal registration mechanism.
-pub trait Signal: Send + Sync + 'static {
+pub trait Signal: Clone + Send + Sync + 'static {
     /// The type of value produced by this signal.
     type Item: Send + Sync + 'static;
 
@@ -66,11 +66,12 @@ where
 // Implement Signal for Source<O>
 impl<O> Signal for Source<O>
 where
-    O: Send + Sync + 'static,
+    O: Clone + Send + Sync + 'static,
 {
     type Item = O;
 
-    fn register(&self, world: &mut World) -> SignalHandle { // Changed return type
+    fn register(&self, world: &mut World) -> SignalHandle {
+        // Changed return type
         let system_id = (self.register_fn)(world);
         SignalHandle::new(vec![system_id.entity()]) // Wrap in SignalHandle
     }
@@ -114,7 +115,8 @@ where
 {
     type Item = U;
 
-    fn register(&self, world: &mut World) -> SignalHandle { // Changed return type
+    fn register(&self, world: &mut World) -> SignalHandle {
+        // Changed return type
         let prev_handle = self.prev_signal.register(world); // Returns SignalHandle
         let mut all_ids = prev_handle.system_ids().to_vec(); // Get Vec<UntypedSystemId>
 
@@ -131,7 +133,7 @@ where
 /// Struct representing a combine node in the signal chain definition. Implements [`Signal`].
 pub struct Combine<Left, Right>
 where
-    Left: Signal, // Use the consolidated Signal trait
+    Left: Signal,  // Use the consolidated Signal trait
     Right: Signal, // Use the consolidated Signal trait
     <Left as Signal>::Item: Send + Sync + 'static,
     <Right as Signal>::Item: Send + Sync + 'static,
@@ -145,7 +147,7 @@ where
 // Add Clone implementation for Combine
 impl<Left, Right> Clone for Combine<Left, Right>
 where
-    Left: Signal + Clone, // Use the consolidated Signal trait
+    Left: Signal + Clone,  // Use the consolidated Signal trait
     Right: Signal + Clone, // Use the consolidated Signal trait
     <Left as Signal>::Item: Send + Sync + 'static,
     <Right as Signal>::Item: Send + Sync + 'static,
@@ -164,14 +166,15 @@ where
 // Implement Signal for Combine<Left, Right>
 impl<Left, Right> Signal for Combine<Left, Right>
 where
-    Left: Signal, // Use the consolidated Signal trait
+    Left: Signal,  // Use the consolidated Signal trait
     Right: Signal, // Use the consolidated Signal trait
     <Left as Signal>::Item: Send + Sync + 'static,
     <Right as Signal>::Item: Send + Sync + 'static,
 {
     type Item = (<Left as Signal>::Item, <Right as Signal>::Item);
 
-    fn register(&self, world: &mut World) -> SignalHandle { // Changed return type
+    fn register(&self, world: &mut World) -> SignalHandle {
+        // Changed return type
         let left_handle = self.left_signal.register(world); // Returns SignalHandle
         let right_handle = self.right_signal.register(world); // Returns SignalHandle
 
@@ -337,7 +340,8 @@ impl SignalBuilder {
 }
 
 /// Extension trait providing combinator methods for types implementing [`Signal`] and [`Clone`].
-pub trait SignalExt: Signal + Clone { // Remove SignalBuilderInternal bound
+pub trait SignalExt: Signal + Clone {
+    // Remove SignalBuilderInternal bound
     /// Appends a transformation step to the signal chain using a Bevy system.
     ///
     /// The provided `system` takes the output `Item` of the previous step (wrapped in `In<Item>`)
@@ -419,7 +423,8 @@ where
 
         let register_fn = Arc::new(
             move |world: &mut World, prev_last_id_entity: UntypedSystemId| -> UntypedSystemId {
-                let system_id = register_signal::<<T as Signal>::Item, U, M>( // Use Signal::Item
+                let system_id = register_signal::<<T as Signal>::Item, U, M>(
+                    // Use Signal::Item
                     world,
                     system_clone.clone(),
                 );
@@ -461,7 +466,8 @@ where
         let register_fn = move |world: &mut World,
                                 left_id_entity: UntypedSystemId,
                                 right_id_entity: UntypedSystemId| {
-            combine_signal::<<Self as Signal>::Item, <S2 as Signal>::Item>( // Use Signal::Item
+            combine_signal::<<Self as Signal>::Item, <S2 as Signal>::Item>(
+                // Use Signal::Item
                 world,
                 left_id_entity,
                 right_id_entity,

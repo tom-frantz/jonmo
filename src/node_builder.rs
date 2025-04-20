@@ -2,11 +2,12 @@
 
 use crate::{
     prelude::*,
+    register_signal,
     signal::{Signal, /* SignalBuilderInternal, */ SignalExt, SignalHandle},
 };
 use bevy_ecs::{prelude::*, system::SystemState};
 use bevy_hierarchy::prelude::*;
-use bevy_reflect::{/* FromReflect, */ FromReflect, Reflect};
+use bevy_reflect::{/* FromReflect, */ FromReflect, GetTypeRegistration, Reflect, Typed};
 use std::sync::{Arc, Mutex};
 
 /// Component storing handles to reactive systems attached to an entity.
@@ -68,45 +69,91 @@ impl NodeBuilder {
     /// The system receives the value emitted by the signal.
     /// Note: The system is registered *directly* on the builder and will be transferred
     /// to the entity's `SignalHandlers` component upon spawning.
-    // pub fn on_signal<S, Marker>(mut self, signal: S, system: impl IntoSystem<S::Item, (), Marker>) -> Self
-    // where
-    //     S: Signal + Send + Sync + 'static,
-    //     S::Item: Send + Sync + 'static,
-    // {
-    //     let handle = signal.into_signal_builder().create_system(system);
-    //     self.signal_handlers.push(handle); // Add handle directly to builder's vec
-    //     self
-    // }
+    pub fn on_signal<S, F, I, O, M>(self, signal: S, system: F) -> Self
+    where
+        S: Signal<Item = I> + Send + Sync + 'static,
+        F: IntoSystem<In<(Entity, I)>, Option<O>, M> + Send + Sync + Clone + 'static,
+        I: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        M: Send + Sync + 'static,
+    {
+        let on_spawn = move |world: &mut World, entity: Entity| {
+            let system = register_signal(world, system);
+            let wrapper_system = move |In(input): In<I>, world: &mut World| {
+                world.run_system_with_input(system, (entity, input)).ok()
+            };
+            let signal = signal.map(wrapper_system);
+            let handle = Signal::register(&signal, world);
+            if let Ok(mut entity) = world.get_entity_mut(entity) {
+                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
+                    handlers.add(handle);
+                }
+            }
+        };
+        self.on_spawn(on_spawn)
+    }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
-    /// The system receives the value emitted by the signal and the node's [`Entity`].
-    /// Note: This registers an `on_spawn` callback. The system itself is created
-    /// and added to the entity's `SignalHandlers` component *during* the `on_spawn` execution.
-    // pub fn on_signal_with_entity<S, Marker>(
-    //     self,
-    //     signal: S,
-    //     system: impl IntoSystem<(S::Item, Entity), (), Marker>,
-    // ) -> Self
-    // where
-    //     S: Signal + Send + Sync + 'static,
-    //     S::Item: Send + Sync + 'static,
-    // {
-    //     self.on_spawn(move |world, entity| {
-    //         // Create the system handle inside the on_spawn callback
-    //         let handle = signal
-    //             .into_signal_builder()
-    //             .create_system_with_entity(entity, system);
+    pub fn signal_from_entity<F, O, M>(self, system: F) -> Self
+    where
+        F: IntoSystem<In<Entity>, Option<O>, M> + Send + Sync + Clone + 'static,
+        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        M: Send + Sync + 'static,
+    {
+        let on_spawn = move |world: &mut World, entity: Entity| {
+            let system = register_signal(world, system);
+            let wrapper_system = move |In(entity): In<Entity>, world: &mut World| {
+                world.run_system_with_input(system, entity).ok()
+            };
+            // TODO: reuse this entity emitting signal somehow ?
+            let signal = SignalBuilder::from_entity(entity).map(wrapper_system);
+            let handle = Signal::register(&signal, world);
+            if let Ok(mut entity) = world.get_entity_mut(entity) {
+                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
+                    handlers.add(handle);
+                }
+            }
+        };
+        self.on_spawn(on_spawn)
+    }
 
-    //         // Add the handle to the entity's SignalHandlers component
-    //         if let Some(mut handlers) = world.get_mut::<SignalHandlers>(entity) {
-    //             handlers.add(handle);
-    //         } else {
-    //              warn!("Entity {:?} despawned or missing SignalHandlers before on_signal_with_entity could register handler.", entity);
-    //              // If the entity or component is gone, we need to clean up the handle we just created.
-    //              handle.cleanup(world);
-    //         }
-    //     })
-    // }
+    /// Register a reactive system that runs when the given [`Signal`] emits a value.
+    /// The system receives the value emitted by the signal and the entity that owns the component.
+    /// This is useful for systems that need to react to changes in a specific component of an entity.
+    /// The system will be registered on the entity's `SignalHandlers` component.
+    /// The system will be run with the entity and the component value as input.
+    /// Note: The system is registered *directly* on the builder and will be transferred
+    /// to the entity's `SignalHandlers` component upon spawning.   
+    pub fn signal_from_component<C, F, O, M>(self, system: F) -> Self
+    where
+        C: Component + Clone + FromReflect + GetTypeRegistration + Typed,
+        F: IntoSystem<In<(Entity, C)>, Option<O>, M> + Send + Sync + Clone + 'static,
+        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        M: Send + Sync + 'static,
+    {
+        let on_spawn = move |world: &mut World, entity: Entity| {
+            let system = register_signal(world, system);
+            let wrapper_system = move |In(entity): In<Entity>, world: &mut World| {
+                let mut components: SystemState<Query<&C>> = SystemState::new(world);
+                if let Ok(component) = components.get(world).get(entity) {
+                    world
+                        .run_system_with_input(system, (entity, component.clone()))
+                        .ok()
+                } else {
+                    None
+                }
+            };
+            // TODO: reuse this entity emitting signal somehow ?
+            let signal = SignalBuilder::from_entity(entity).map(wrapper_system);
+            let handle = Signal::register(&signal, world);
+            if let Ok(mut entity) = world.get_entity_mut(entity) {
+                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
+                    handlers.add(handle);
+                }
+            }
+        };
+        self.on_spawn(on_spawn)
+    }
 
     /// Declare a static child node.
     /// The child is spawned and added to the parent when the parent is spawned.
@@ -131,16 +178,15 @@ impl NodeBuilder {
     /// Declare a reactive child. When the [`Signal`] outputs [`None`], the child is removed.
     pub fn child_signal<T: Into<Option<NodeBuilder>> + FromReflect>(
         self,
-        child_option: impl Signal<Item = T> + Clone + Send + Sync + 'static,
+        child_option: impl Signal<Item = T> + Send + Sync + 'static,
     ) -> Self {
         let block = self.child_block_populations.lock().unwrap().len();
         self.child_block_populations.lock().unwrap().push(0);
         let child_block_populations = self.child_block_populations.clone();
         let on_spawn = move |world: &mut World, parent: Entity| {
-            let system = move |In(child_option): In<T>, world: &mut World| {
-                let mut existing_child_option: SystemState<Local<Option<Entity>>> = SystemState::new(world);
+            let system = move |In(child_option): In<T>, world: &mut World, mut existing_child_option: Local<Option<Entity>>| {
                 if let Some(child) = child_option.into() {
-                    if let Some(existing_child) = *existing_child_option.get(world) {
+                    if let Some(existing_child) = existing_child_option.take() {
                         if let Ok(entity) = world.get_entity_mut(existing_child) {
                             entity.despawn_recursive();
                         }
@@ -150,7 +196,7 @@ impl NodeBuilder {
                         let offset = offset(block, &child_block_populations.lock().unwrap());
                         parent.insert_children(offset, &[child_entity]);
                         child.spawn_on_entity(world, child_entity);
-                        *existing_child_option.get_mut(world) = Some(child_entity);
+                        *existing_child_option = Some(child_entity);
                     } else {
                         if let Ok(child) = world.get_entity_mut(child_entity) {
                             child.despawn_recursive();
@@ -158,7 +204,7 @@ impl NodeBuilder {
                     }
                     child_block_populations.lock().unwrap()[block] = 1;
                 } else {
-                    if let Some(existing_child) = existing_child_option.get_mut(world).take() {
+                    if let Some(existing_child) = existing_child_option.take() {
                         if let Ok(entity) = world.get_entity_mut(existing_child) {
                             entity.despawn_recursive();
                         }
@@ -231,43 +277,43 @@ impl NodeBuilder {
 
         let on_spawn = move |world: &mut World, parent: Entity| {
             // Define the system that will handle VecDiff updates
-            let system = move |In(diffs): In<Vec<VecDiff<NodeBuilder>>>, world: &mut World| {
-                let mut children_entities: SystemState<Local<Vec<Entity>>> = SystemState::new(world);
+            let system = move |In(diffs): In<Vec<VecDiff<NodeBuilder>>>, world: &mut World, mut children_entities: Local<Vec<Entity>>| {
                 for diff in diffs {
                     match diff {
                         VecDiff::Replace { values: children } => {
-                            for child_entity in children_entities.get_mut(world).drain(..) {
+                            for child_entity in children_entities.drain(..) {
                                 if let Ok(child) = world.get_entity_mut(child_entity) {
                                     child.despawn_recursive();
                                 }
                             }
-                            *children_entities.get_mut(world) =
+                            *children_entities =
                                 children.iter().map(|_| world.spawn_empty().id()).collect();
                             if let Ok(mut parent) = world.get_entity_mut(parent) {
                                 let offset =
                                     offset(block, &child_block_populations.lock().unwrap());
-                                parent.insert_children(offset, &children_entities.get(world));
-                                for (child, child_entity) in children
-                                    .into_iter()
-                                    .zip(children_entities.get(world).iter().copied())
+                                parent.insert_children(offset, &children_entities);
+                                for (child, child_entity) in
+                                    children.into_iter().zip(children_entities.iter().copied())
                                 {
                                     child.spawn_on_entity(world, child_entity);
                                 }
                                 child_block_populations.lock().unwrap()[block] =
-                                    children_entities.get(world).len();
+                                    children_entities.len();
                             }
                         }
-                        VecDiff::InsertAt { index, value: child } => {
+                        VecDiff::InsertAt {
+                            index,
+                            value: child,
+                        } => {
                             let child_entity = world.spawn_empty().id();
                             if let Ok(mut parent) = world.get_entity_mut(parent) {
-                                let offset = offset(
-                                    block,
-                                    &child_block_populations.lock().unwrap(),
-                                );
-                                parent.insert_children(offset + index, &[child_entity])
+                                let offset =
+                                    offset(block, &child_block_populations.lock().unwrap());
+                                parent.insert_children(offset + index, &[child_entity]);
                                 child.spawn_on_entity(world, child_entity);
-                                children_entities.get_mut(world).insert(index, child_entity);
-                                child_block_populations.lock().unwrap()[block] = children_entities.get(world).len();
+                                children_entities.insert(index, child_entity);
+                                child_block_populations.lock().unwrap()[block] =
+                                    children_entities.len();
                             } else {
                                 // Parent despawned during child insertion
                                 if let Ok(child) = world.get_entity_mut(child_entity) {
@@ -277,50 +323,82 @@ impl NodeBuilder {
                         }
                         VecDiff::Push { value: child } => {
                             let child_entity = world.spawn_empty().id();
-                            if let Ok(mut parent) = world.get_entity_mut(parent) {
-                                let offset = offset(block, &child_block_populations.lock().unwrap());
-                                parent.insert_children(offset + children_entities.get(world).len(), &[child_entity]);
-                                child.spawn_on_entity(world, child_entity);
-                                children_entities.get_mut(world).push(child_entity);
-                                child_block_populations.lock().unwrap()[block] = children_entities.get(world).len();
-                            } else {  // parent despawned during child spawning
-                                if let Ok(child) = world.get_entity_mut(child_entity) {
-                                    child.despawn_recursive();
+                            let mut push_child_entity = false;
+                            {
+                                if let Ok(mut parent) = world.get_entity_mut(parent) {
+                                    let offset =
+                                        offset(block, &child_block_populations.lock().unwrap());
+                                    parent.insert_children(
+                                        offset + children_entities.len(),
+                                        &[child_entity],
+                                    );
+                                    child.spawn_on_entity(world, child_entity);
+                                    push_child_entity = true;
+                                    child_block_populations.lock().unwrap()[block] =
+                                        children_entities.len();
+                                } else {
+                                    // parent despawned during child spawning
+                                    if let Ok(child) = world.get_entity_mut(child_entity) {
+                                        child.despawn_recursive();
+                                    }
                                 }
+                            }
+                            if push_child_entity {
+                                children_entities.push(child_entity);
                             }
                         }
                         VecDiff::UpdateAt { index, value: node } => {
-                            if let Some(existing_child) = children_entities.get(world).get(index).copied() {
+                            if let Some(existing_child) =
+                                children_entities.get(index).copied()
+                            {
                                 if let Ok(child) = world.get_entity_mut(existing_child) {
-                                    child.despawn_recursive();  // removes from parent
+                                    child.despawn_recursive(); // removes from parent
                                 }
                             }
                             let child_entity = world.spawn_empty().id();
+                            let mut set_child_entity = false;
                             if let Ok(mut parent) = world.get_entity_mut(parent) {
-                                children_entities.get_mut(world)[index] = child_entity;
-                                let offset = offset(block, &child_block_populations.lock().unwrap());
+                                set_child_entity = true;
+                                let offset =
+                                    offset(block, &child_block_populations.lock().unwrap());
                                 parent.insert_children(offset + index, &[child_entity]);
                                 node.spawn_on_entity(world, child_entity);
-                            } else {  // parent despawned during child spawning
+                            } else {
+                                // parent despawned during child spawning
                                 if let Ok(child) = world.get_entity_mut(child_entity) {
                                     child.despawn_recursive();
                                 }
+                            }
+                            if set_child_entity {
+                                children_entities[index] = child_entity;
                             }
                         }
                         VecDiff::Move {
                             old_index,
                             new_index,
                         } => {
-                            children_entities.get_mut(world).swap(old_index, new_index);
-                            fn move_from_to(parent: &mut EntityWorldMut, children_entities: &[Entity], old_index: usize, new_index: usize) {
+                            children_entities.swap(old_index, new_index);
+                            fn move_from_to(
+                                parent: &mut EntityWorldMut,
+                                children_entities: &[Entity],
+                                old_index: usize,
+                                new_index: usize,
+                            ) {
                                 if old_index != new_index {
-                                    if let Some(old_entity) = children_entities.get(old_index).copied() {
+                                    if let Some(old_entity) =
+                                        children_entities.get(old_index).copied()
+                                    {
                                         parent.remove_children(&[old_entity]);
                                         parent.insert_children(new_index, &[old_entity]);
                                     }
                                 }
                             }
-                            fn swap(parent: &mut EntityWorldMut, children_entities: &[Entity], a: usize, b: usize) {
+                            fn swap(
+                                parent: &mut EntityWorldMut,
+                                children_entities: &[Entity],
+                                a: usize,
+                                b: usize,
+                            ) {
                                 move_from_to(parent, children_entities, a, b);
                                 match a.cmp(&b) {
                                     std::cmp::Ordering::Less => {
@@ -333,40 +411,51 @@ impl NodeBuilder {
                                 }
                             }
                             if let Ok(mut parent) = world.get_entity_mut(parent) {
-                                let offset = offset(block, &child_block_populations.lock().unwrap());
-                                swap(&mut parent, children_entities.get(world).as_slice(), offset + old_index, offset + new_index);
+                                let offset =
+                                    offset(block, &child_block_populations.lock().unwrap());
+                                swap(
+                                    &mut parent,
+                                    &children_entities,
+                                    offset + old_index,
+                                    offset + new_index,
+                                );
                             }
                         }
                         VecDiff::RemoveAt { index } => {
-                            if let Some(existing_child) = children_entities.get(world).get(index).copied() {
+                            if let Some(existing_child) =
+                                children_entities.get(index).copied()
+                            {
                                 if let Ok(child) = world.get_entity_mut(existing_child) {
-                                    child.despawn_recursive();  // removes from parent
+                                    child.despawn_recursive(); // removes from parent
                                 }
-                                children_entities.get_mut(world).remove(index);
-                                child_block_populations.lock().unwrap()[block] = children_entities.get(world).len();
+                                children_entities.remove(index);
+                                child_block_populations.lock().unwrap()[block] =
+                                    children_entities.len();
                             }
                         }
                         VecDiff::Pop => {
-                            if let Some(child_entity) = children_entities.get_mut(world).pop() {
+                            if let Some(child_entity) = children_entities.pop() {
                                 if let Ok(child) = world.get_entity_mut(child_entity) {
                                     child.despawn_recursive();
                                 }
-                                child_block_populations.lock().unwrap()[block] = children_entities.get(world).len();
+                                child_block_populations.lock().unwrap()[block] =
+                                    children_entities.len();
                             }
                         }
                         VecDiff::Clear => {
-                            for child_entity in children_entities.get_mut(world).drain(..) {
+                            for child_entity in children_entities.drain(..) {
                                 if let Ok(child) = world.get_entity_mut(child_entity) {
                                     child.despawn_recursive();
                                 }
                             }
-                            child_block_populations.lock().unwrap()[block] = children_entities.get(world).len();
+                            child_block_populations.lock().unwrap()[block] =
+                                children_entities.len();
                         }
                     }
                 }
                 TERMINATE
             };
-            let signal = children_signal_vec.map(system);
+            let signal = children_signal_vec.for_each(system);
             let handle = SignalVec::register(&signal, world);
 
             if let Ok(mut entity_mut) = world.get_entity_mut(parent) {

@@ -176,18 +176,35 @@ where
     system_id
 }
 
+#[derive(Event)]
+pub(crate) struct MarkSignalRoot(UntypedSystemId);
+
+#[derive(Event)]
+pub(crate) struct PipeSignal(UntypedSystemId, UntypedSystemId);
+
+pub(crate) fn consume_mark_signal_root(
+    mut events: EventReader<MarkSignalRoot>,
+    mut signal_propagator: ResMut<SignalPropagator>,
+) {
+    for &MarkSignalRoot(system_entity) in events.read() {
+        signal_propagator.add_root(system_entity);
+    }
+}
+
+pub(crate) fn consume_pipe_signal(
+    mut events: EventReader<PipeSignal>,
+    mut signal_propagator: ResMut<SignalPropagator>,
+) {
+    for &PipeSignal(source, target) in events.read() {
+        signal_propagator.add_child(source, target);
+    }
+}
+
 /// Helper to mark a system entity as a root in the [`SignalPropagator`].
 ///
 /// Root systems are the starting points for signal propagation during the `Update` phase.
 pub fn mark_signal_root(world: &mut World, system_entity: UntypedSystemId) {
-    if let Some(mut propagator) = world.get_resource_mut::<SignalPropagator>() {
-        propagator.add_root(system_entity);
-    } else {
-        warn!(
-            "SignalPropagator resource not found while registering root {:?}",
-            system_entity
-        );
-    }
+    world.send_event(MarkSignalRoot(system_entity));
 }
 
 /// Helper to connect two system entities in the [`SignalPropagator`] graph.
@@ -195,14 +212,7 @@ pub fn mark_signal_root(world: &mut World, system_entity: UntypedSystemId) {
 /// Establishes a parent-child relationship, indicating that the output of the `source`
 /// system should be passed as input to the `target` system during propagation.
 pub fn pipe_signal(world: &mut World, source: UntypedSystemId, target: UntypedSystemId) {
-    if let Some(mut propagator) = world.get_resource_mut::<SignalPropagator>() {
-        propagator.add_child(source, target);
-    } else {
-        warn!(
-            "SignalPropagator resource not found while piping {:?} -> {:?}",
-            source, target
-        );
-    }
+    world.send_event(PipeSignal(source, target));
 }
 
 /// Helper to register the systems needed for combining two signal branches.

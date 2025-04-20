@@ -3,13 +3,13 @@ use bevy_reflect::{FromReflect, GetTypeRegistration, Typed, prelude::*}; // Add 
 use std::{
     fmt,
     marker::PhantomData,
-    ops::{Deref, DerefMut},
-    sync::{Arc, OnceLock},
-}; // Added Deref, DerefMut
+    ops::Deref,
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}, // Added RwLock and guards
+};
 
 use crate::{
     signal::SignalHandle, // Use SignalHandle::new constructor
-    tree::{UntypedSystemId, pipe_signal, register_signal}, // Removed mark_signal_root
+    tree::{UntypedSystemId, pipe_signal, register_signal}, // Removed mark_signal_root // Removed unused SignalNodeMetadata
 };
 // Removed unused RunSystemOnce import
 // Removed unused crate::identity import
@@ -158,7 +158,7 @@ where
 ///
 /// Instead of yielding the entire `Vec` with each change, it yields [`VecDiff<T>`]
 /// describing the change. This trait combines the public concept with internal registration.
-pub trait SignalVec: Send + Sync + 'static {
+pub trait SignalVec: Clone + Send + Sync + 'static {
     /// The type of items in the vector.
     type Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static;
 
@@ -183,7 +183,7 @@ where
 // Implement SignalVec for SourceVec<T>
 impl<T> SignalVec for SourceVec<T>
 where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    T: Clone + Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     type Item = T;
 
@@ -214,6 +214,55 @@ where
     pub(crate) prev_signal: Prev,
     pub(crate) register_fn: Arc<MapVecRegisterFn>,
     _marker: PhantomData<U>,
+}
+
+/// A terminal node in a `SignalVec` chain that executes a system for each batch.
+pub struct ForEachVec<Prev>
+where
+    Prev: SignalVec, // Use consolidated SignalVec trait
+    <Prev as SignalVec>::Item:
+        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+{
+    pub(crate) prev_signal: Prev,
+    pub(crate) register_fn: Arc<MapVecRegisterFn>, // Re-use MapVecRegisterFn type alias
+}
+
+impl<Prev> Clone for ForEachVec<Prev>
+where
+    Prev: SignalVec + Clone, // Use consolidated SignalVec trait
+    <Prev as SignalVec>::Item:
+        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            prev_signal: self.prev_signal.clone(),
+            register_fn: self.register_fn.clone(),
+        }
+    }
+}
+
+// Implement SignalVec for ForEachVec<Prev>
+// Note: Item is (), as this is a terminal node.
+impl<Prev> SignalVec for ForEachVec<Prev>
+where
+    Prev: SignalVec, // Use consolidated SignalVec trait
+    <Prev as SignalVec>::Item:
+        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+{
+    type Item = (); // Terminal node, effectively produces no further signal items
+
+    fn register(&self, world: &mut World) -> SignalHandle {
+        let prev_handle = self.prev_signal.register(world);
+        let mut all_ids = prev_handle.system_ids().to_vec();
+
+        if let Some(&prev_last_id_entity) = all_ids.last() {
+            let new_system_entity = (self.register_fn)(world, prev_last_id_entity);
+            all_ids.push(new_system_entity);
+        } else {
+            bevy_log::error!("ForEachVec signal parent registration returned empty ID list.");
+        }
+        SignalHandle::new(all_ids)
+    }
 }
 
 impl<Prev, U> Clone for MapVec<Prev, U>
@@ -283,7 +332,8 @@ where
 }
 
 /// Extension trait providing combinator methods for types implementing [`SignalVec`] and [`Clone`].
-pub trait SignalVecExt: SignalVec + Clone { // Use consolidated SignalVec trait
+pub trait SignalVecExt: SignalVec + Clone {
+    // Use consolidated SignalVec trait
     /// Creates a new `SignalVec` which maps the items within the output diffs of this `SignalVec`
     /// using the given Bevy system `F: IntoSystem<In<Self::Item>, Option<U>, M>`.
     ///
@@ -300,7 +350,7 @@ pub trait SignalVecExt: SignalVec + Clone { // Use consolidated SignalVec trait
         <Self as SignalVec>::Item:
             Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        F: IntoSystem<In<<Self as SignalVec>::Item>, Option<U>, M>
+        F: IntoSystem<In<<Self as SignalVec>::Item>, U, M>
             // F takes In<T>, returns Option<U>
             + Send
             + Sync
@@ -309,6 +359,21 @@ pub trait SignalVecExt: SignalVec + Clone { // Use consolidated SignalVec trait
         M: Send + Sync + 'static;
 
     // TODO: Add other combinators like filter, len, etc.
+
+    /// Registers a system that runs for each batch of `VecDiff`s emitted by this signal.
+    ///
+    /// The provided system `F` takes `In<Vec<VecDiff<Self::Item>>>` and returns `()`.
+    /// This method consumes the signal stream at this point; no further signals are propagated.
+    ///
+    /// Returns a [`ForEachVec`] node representing this terminal operation.
+    /// Call `.register(world)` on the result to activate the chain and get a [`SignalHandle`].
+    fn for_each<M, F>(self, system: F) -> ForEachVec<Self>
+    where
+        Self: Sized,
+        <Self as SignalVec>::Item:
+            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        F: IntoSystem<In<Vec<VecDiff<Self::Item>>>, Option<()>, M> + Send + Sync + Clone + 'static,
+        M: Send + Sync + 'static;
 
     /// Registers all the systems defined in this `SignalVec` chain into the Bevy `World`.
     ///
@@ -326,7 +391,7 @@ where
         <T as SignalVec>::Item:
             Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        F: IntoSystem<In<<T as SignalVec>::Item>, Option<U>, M> // F takes In<T>, returns Option<U>
+        F: IntoSystem<In<<T as SignalVec>::Item>, U, M> // F takes In<T>, returns Option<U>
             + Send
             + Sync
             + Clone
@@ -362,14 +427,10 @@ where
                         for diff_t in diff_batch {
                             let maybe_diff_u: Option<VecDiff<U>> = match diff_t {
                                 VecDiff::Replace { values } => {
-                                    println!("replacing");
                                     let mapped_values: Vec<U> = values
                                         .into_iter()
                                         .filter_map(|v| {
-                                            world
-                                                .run_system_with_input(user_system_id, v)
-                                                .ok()
-                                                .flatten()
+                                            world.run_system_with_input(user_system_id, v).ok()
                                         })
                                         .collect();
                                     Some(VecDiff::Replace {
@@ -379,7 +440,6 @@ where
                                 VecDiff::InsertAt { index, value } => world
                                     .run_system_with_input(user_system_id, value)
                                     .ok()
-                                    .flatten()
                                     .map(|mapped_value| VecDiff::InsertAt {
                                         index,
                                         value: mapped_value,
@@ -387,21 +447,16 @@ where
                                 VecDiff::UpdateAt { index, value } => world
                                     .run_system_with_input(user_system_id, value)
                                     .ok()
-                                    .flatten()
                                     .map(|mapped_value| VecDiff::UpdateAt {
                                         index,
                                         value: mapped_value,
                                     }),
-                                VecDiff::Push { value } => {
-                                    println!("pushing");
-                                    world
-                                        .run_system_with_input(user_system_id, value)
-                                        .ok()
-                                        .flatten()
-                                        .map(|mapped_value| VecDiff::Push {
-                                            value: mapped_value,
-                                        })
-                                }
+                                VecDiff::Push { value } => world
+                                    .run_system_with_input(user_system_id, value)
+                                    .ok()
+                                    .map(|mapped_value| VecDiff::Push {
+                                        value: mapped_value,
+                                    }),
                                 // Pass through structural variants
                                 VecDiff::RemoveAt { index } => Some(VecDiff::RemoveAt { index }),
                                 VecDiff::Move {
@@ -448,6 +503,40 @@ where
         }
     }
 
+    fn for_each<M, F>(self, system: F) -> ForEachVec<Self>
+    where
+        <T as SignalVec>::Item:
+            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        F: IntoSystem<In<Vec<VecDiff<Self::Item>>>, Option<()>, M> + Send + Sync + Clone + 'static,
+        M: Send + Sync + 'static,
+    {
+        let system_clone = system.clone();
+
+        let register_fn = Arc::new(
+            move |world: &mut World, prev_last_id_entity: UntypedSystemId| -> UntypedSystemId {
+                // Register the user's system. Input: Vec<VecDiff<T::Item>>, Output: ()
+                // register_signal wraps it to return Option<()>
+                let final_system_id = register_signal::<Vec<VecDiff<<T as SignalVec>::Item>>, (), M>(
+                    world, // Pass world to register_signal
+                    system_clone.clone(),
+                );
+                let final_system_entity = final_system_id.entity();
+
+                // Pipe the previous signal's output into the user's system.
+                pipe_signal(world, prev_last_id_entity, final_system_entity); // Pass world to pipe_signal
+
+                // Return the entity of the registered user system.
+                final_system_entity
+            },
+        );
+
+        // Return the ForEachVec struct, not a SignalHandle
+        ForEachVec {
+            prev_signal: self,
+            register_fn,
+        }
+    }
+
     fn register(&self, world: &mut World) -> SignalHandle {
         // Directly call the register method from the consolidated SignalVec trait
         <T as SignalVec>::register(self, world)
@@ -455,22 +544,221 @@ where
 }
 
 //-------------------------------------------------------------------------------------------------
-// MutableVec - Reverted to pending_diffs and flush sending batch
+// Lock Guards
 //-------------------------------------------------------------------------------------------------
 
-/// A mutable vector that tracks changes as `VecDiff`s and sends them as a batch on `flush`.
-#[derive(Debug)]
-pub struct MutableVec<T>
+/// A read guard for `MutableVec`, providing immutable access to the underlying `Vec`.
+/// The guard holds the read lock, ensuring safe access.
+pub struct MutableVecReadGuard<'a, T>
 where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone, // Removed PartialEq
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
+{
+    guard: RwLockReadGuard<'a, MutableVecState<T>>,
+}
+
+impl<'a, T> Deref for MutableVecReadGuard<'a, T>
+where
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
+{
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The guard ensures the data is valid for the lifetime 'a.
+        &self.guard.vec
+    }
+}
+
+/// A write guard for `MutableVec`, providing mutable access to the underlying `Vec`.
+/// The guard holds the write lock. Changes made through this guard automatically queue
+/// the corresponding `VecDiff`s.
+pub struct MutableVecWriteGuard<'a, T>
+where
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
+{
+    guard: RwLockWriteGuard<'a, MutableVecState<T>>,
+}
+
+// We cannot directly implement DerefMut to &mut Vec<T> because we need to intercept
+// mutations to queue diffs. Instead, we provide explicit methods.
+
+impl<'a, T> MutableVecWriteGuard<'a, T>
+where
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
+{
+    /// Returns a mutable reference to the element at `index`, or `None` if out of bounds.
+    /// Note: This method does *not* automatically queue an `UpdateAt` diff.
+    /// Use `set` for that. This is for complex mutations where a single `UpdateAt`
+    /// isn't appropriate, or when you intend to call other methods like `remove` afterwards.
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.guard.vec.get_mut(index)
+    }
+
+    /// Returns mutable slices covering the whole vector.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.guard.vec.as_mut_slice()
+    }
+
+    // --- Methods that queue diffs ---
+
+    /// Pushes a value to the end of the vector and queues a `VecDiff::Push`.
+    pub fn push(&mut self, value: T) {
+        self.guard.vec.push(value.clone());
+        self.guard.pending_diffs.push(VecDiff::Push { value });
+    }
+
+    /// Removes the last element from the vector and returns it, or `None` if it is empty.
+    /// Queues a `VecDiff::Pop` if an element was removed.
+    pub fn pop(&mut self) -> Option<T> {
+        let result = self.guard.vec.pop();
+        if result.is_some() {
+            self.guard.pending_diffs.push(VecDiff::Pop);
+        }
+        result
+    }
+
+    /// Inserts an element at `index` within the vector, shifting all elements after it to the right.
+    /// Queues a `VecDiff::InsertAt`.
+    /// # Panics
+    /// Panics if `index > len`.
+    pub fn insert(&mut self, index: usize, value: T) {
+        self.guard.vec.insert(index, value.clone());
+        self.guard
+            .pending_diffs
+            .push(VecDiff::InsertAt { index, value });
+    }
+
+    /// Removes and returns the element at `index` within the vector, shifting all elements after it to the left.
+    /// Queues a `VecDiff::RemoveAt`.
+    /// # Panics
+    /// Panics if `index` is out of bounds.
+    pub fn remove(&mut self, index: usize) -> T {
+        let value = self.guard.vec.remove(index);
+        self.guard.pending_diffs.push(VecDiff::RemoveAt { index });
+        value
+    }
+
+    /// Removes all elements from the vector.
+    /// Queues a `VecDiff::Clear` if the vector was not empty.
+    pub fn clear(&mut self) {
+        if !self.guard.vec.is_empty() {
+            self.guard.vec.clear();
+            self.guard.pending_diffs.push(VecDiff::Clear);
+        }
+    }
+
+    /// Updates the element at `index` with a new `value`.
+    /// Queues a `VecDiff::UpdateAt`.
+    /// # Panics
+    /// Panics if `index` is out of bounds.
+    pub fn set(&mut self, index: usize, value: T) {
+        let len = self.guard.vec.len();
+        if index < len {
+            self.guard.vec[index] = value.clone();
+            self.guard
+                .pending_diffs
+                .push(VecDiff::UpdateAt { index, value });
+        } else {
+            panic!(
+                "MutableVecWriteGuard::set: index {} out of bounds for len {}",
+                index, len
+            );
+        }
+    }
+
+    /// Moves an item from `old_index` to `new_index`.
+    /// Queues a `VecDiff::Move` if the indices are different and valid.
+    /// # Panics
+    /// Panics if `old_index` or `new_index` are out of bounds.
+    pub fn move_item(&mut self, old_index: usize, new_index: usize) {
+        let len = self.guard.vec.len();
+        if old_index >= len || new_index >= len {
+            panic!(
+                "MutableVecWriteGuard::move_item: index out of bounds (len: {}, old: {}, new: {})",
+                len, old_index, new_index
+            );
+        }
+
+        if old_index != new_index {
+            let value = self.guard.vec.remove(old_index);
+            self.guard.vec.insert(new_index, value);
+            self.guard.pending_diffs.push(VecDiff::Move {
+                old_index,
+                new_index,
+            });
+        }
+    }
+
+    /// Replaces the entire contents of the vector with the provided `values`.
+    /// Queues a `VecDiff::Replace`.
+    pub fn replace(&mut self, values: Vec<T>) {
+        self.guard.vec = values.clone();
+        self.guard.pending_diffs.push(VecDiff::Replace { values });
+    }
+
+    // --- Provide immutable access via Deref ---
+    // This allows reading the state even with a write guard.
+}
+
+impl<'a, T> Deref for MutableVecWriteGuard<'a, T>
+where
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
+{
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The guard ensures the data is valid for the lifetime 'a.
+        &self.guard.vec
+    }
+}
+
+//-------------------------------------------------------------------------------------------------
+// MutableVec - Updated to use Guards
+//-------------------------------------------------------------------------------------------------
+
+/// Internal state for `MutableVec`, allowing `MutableVec` to be `Clone`.
+#[derive(Debug)]
+struct MutableVecState<T>
+where
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
 {
     vec: Vec<T>,
-    pending_diffs: Vec<VecDiff<T>>, // Store pending changes
+    pending_diffs: Vec<VecDiff<T>>,
     listeners: Vec<UntypedSystemId>,
+}
+
+/// A mutable vector that tracks changes as `VecDiff`s and sends them as a batch on `flush`.
+/// This struct is `Clone`able, sharing the underlying state.
+#[derive(Debug, Clone)]
+pub struct MutableVec<T>
+where
+    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
+{
+    state: Arc<RwLock<MutableVecState<T>>>,
 }
 
 #[derive(Component)]
 struct QueuedVecDiffs<T: FromReflect + GetTypeRegistration + Typed>(Vec<VecDiff<T>>);
+
+impl<T, A: Clone + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static> From<T>
+    for MutableVec<A>
+where
+    Vec<A>: From<T>,
+{
+    #[inline]
+    fn from(values: T) -> Self {
+        MutableVec {
+            state: Arc::new(RwLock::new(MutableVecState {
+                vec: values.into(),
+                pending_diffs: Vec::new(),
+                listeners: Vec::new(),
+            })),
+        }
+    }
+}
 
 impl<T> MutableVec<T>
 where
@@ -479,24 +767,104 @@ where
     /// Creates a new, empty `MutableVec`.
     pub fn new() -> Self {
         Self {
-            vec: Vec::new(),
-            pending_diffs: Vec::new(),
-            listeners: Vec::new(),
+            state: Arc::new(RwLock::new(MutableVecState {
+                vec: Vec::new(),
+                pending_diffs: Vec::new(),
+                listeners: Vec::new(),
+            })),
         }
     }
 
     /// Creates a new `MutableVec` initialized with the given values.
     pub fn with_values(values: Vec<T>) -> Self {
         Self {
-            pending_diffs: Vec::new(),
-            vec: values,
-            listeners: Vec::new(),
+            state: Arc::new(RwLock::new(MutableVecState {
+                pending_diffs: Vec::new(), // Start with empty diffs
+                vec: values,
+                listeners: Vec::new(),
+            })),
         }
     }
 
+    /// Acquires a read lock, returning a guard that provides immutable access.
+    #[inline]
+    pub fn read(&self) -> MutableVecReadGuard<'_, T> {
+        MutableVecReadGuard {
+            guard: self.state.read().unwrap(),
+        }
+    }
+
+    /// Acquires a write lock, returning a guard that provides mutable access
+    /// and automatically queues diffs for modifications.
+    #[inline]
+    pub fn write(&self) -> MutableVecWriteGuard<'_, T> {
+        MutableVecWriteGuard {
+            guard: self.state.write().unwrap(),
+        }
+    }
+
+    // --- Convenience methods (delegate to guards) ---
+
+    /// Returns the number of elements in the vector (acquires read lock).
+    pub fn len(&self) -> usize {
+        self.read().len()
+    }
+
+    /// Returns `true` if the vector contains no elements (acquires read lock).
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// Returns a clone of the element at `index`, or `None` if out of bounds (acquires read lock).
+    pub fn get(&self, index: usize) -> Option<T> {
+        self.read().get(index).cloned()
+    }
+
+    /// Pushes a value to the end of the vector (acquires write lock).
+    pub fn push(&self, value: T) {
+        self.write().push(value);
+    }
+
+    /// Removes the last element from the vector and returns it (acquires write lock).
+    pub fn pop(&self) -> Option<T> {
+        self.write().pop()
+    }
+
+    /// Inserts an element at `index` (acquires write lock).
+    pub fn insert(&self, index: usize, value: T) {
+        self.write().insert(index, value);
+    }
+
+    /// Removes and returns the element at `index` (acquires write lock).
+    pub fn remove(&self, index: usize) -> T {
+        self.write().remove(index)
+    }
+
+    /// Removes all elements from the vector (acquires write lock).
+    pub fn clear(&self) {
+        self.write().clear();
+    }
+
+    /// Updates the element at `index` with a new `value` (acquires write lock).
+    pub fn set(&self, index: usize, value: T) {
+        self.write().set(index, value);
+    }
+
+    /// Moves an item from `old_index` to `new_index` (acquires write lock).
+    pub fn move_item(&self, old_index: usize, new_index: usize) {
+        self.write().move_item(old_index, new_index);
+    }
+
+    /// Replaces the entire contents of the vector (acquires write lock).
+    pub fn replace(&self, values: Vec<T>) {
+        self.write().replace(values);
+    }
+
+    // --- Signal-related methods (unchanged for now, still need direct lock access) ---
+
     /// Creates a [`SourceVec<T>`] signal linked to this `MutableVec`.
-    /// Registers an identity system to process batches of diffs sent by `flush`.
-    pub fn signal_vec(&mut self, world: &mut World) -> SourceVec<T> {
+    pub fn signal_vec(&self, world: &mut World) -> SourceVec<T> {
+        // ... (Implementation remains the same, using self.state.read/write directly) ...
         // Register the identity batch system.
         // Input is Vec<VecDiff<T>>, Output is Option<Vec<VecDiff<T>>>.
         let source_system_id_lock = Arc::new(OnceLock::new());
@@ -514,17 +882,21 @@ where
             }
         });
         let entity = source_system_id.entity();
+
+        // Initialize with Replace diff containing current state
+        let initial_values = self.state.read().unwrap().vec.clone(); // Read lock to get initial values
         world
             .entity_mut(entity)
             .insert(QueuedVecDiffs(vec![VecDiff::Replace {
-                values: self.vec.clone(),
+                values: initial_values,
             }]));
         source_system_id_lock.set(entity).unwrap();
 
         // Mark this system as a root for propagation
         crate::tree::mark_signal_root(world, entity);
 
-        self.listeners.push(entity);
+        // Add listener to the shared state
+        self.state.write().unwrap().listeners.push(entity); // Write lock to add listener
 
         SourceVec {
             entity,
@@ -533,136 +905,25 @@ where
     }
 
     /// Sends any pending `VecDiff`s accumulated since the last flush to the signal system.
-    pub fn flush(&mut self, world: &mut World) {
-        if !self.pending_diffs.is_empty() {
-            for &listener in &self.listeners {
+    pub fn flush(&self, world: &mut World) {
+        // ... (Implementation remains the same, using self.state.write directly) ...
+        let mut state = self.state.write().unwrap(); // Acquire write lock once
+        if !state.pending_diffs.is_empty() {
+            for &listener in &state.listeners {
                 if let Ok(mut entity) = world.get_entity_mut(listener) {
                     if let Some(mut queued_diffs) = entity.get_mut::<QueuedVecDiffs<T>>() {
-                        println!("Flushing pending diffs");
-                        queued_diffs.0.extend(self.pending_diffs.clone());
+                        queued_diffs.0.extend(state.pending_diffs.clone()); // Clone diffs to extend
                     }
                 }
             }
-            self.pending_diffs.clear();
+            state.pending_diffs.clear();
         }
     }
 
-    // --- Modification Methods (Add diffs to pending_diffs) ---
-
-    /// Pushes a value to the end of the vector and queues a `VecDiff::Push`.
-    pub fn push(&mut self, value: T) {
-        self.vec.push(value.clone());
-        self.pending_diffs.push(VecDiff::Push { value });
-    }
-
-    /// Removes the last element from the vector and returns it, or `None` if it is empty.
-    /// Queues a `VecDiff::Pop` if an element was removed.
-    pub fn pop(&mut self) -> Option<T> {
-        let result = self.vec.pop();
-        if result.is_some() {
-            self.pending_diffs.push(VecDiff::Pop);
-        }
-        result
-    }
-
-    /// Inserts an element at `index` within the vector, shifting all elements after it to the right.
-    /// Queues a `VecDiff::InsertAt`.
-    /// # Panics
-    /// Panics if `index > len`.
-    pub fn insert(&mut self, index: usize, value: T) {
-        self.vec.insert(index, value.clone());
-        self.pending_diffs.push(VecDiff::InsertAt { index, value });
-    }
-
-    /// Removes and returns the element at `index` within the vector, shifting all elements after it to the left.
-    /// Queues a `VecDiff::RemoveAt`.
-    /// # Panics
-    /// Panics if `index` is out of bounds.
-    pub fn remove(&mut self, index: usize) -> T {
-        let value = self.vec.remove(index);
-        self.pending_diffs.push(VecDiff::RemoveAt { index });
-        value
-    }
-
-    /// Removes all elements from the vector.
-    /// Queues a `VecDiff::Clear` if the vector was not empty.
-    pub fn clear(&mut self) {
-        if !self.vec.is_empty() {
-            self.vec.clear();
-            self.pending_diffs.push(VecDiff::Clear);
-        }
-    }
-
-    /// Updates the element at `index` with a new `value`.
-    /// Queues a `VecDiff::UpdateAt`.
-    /// # Panics
-    /// Panics if `index` is out of bounds.
-    pub fn set(&mut self, index: usize, value: T) {
-        let len = self.vec.len();
-        if index < len {
-            self.vec[index] = value.clone();
-            self.pending_diffs.push(VecDiff::UpdateAt { index, value });
-        } else {
-            panic!(
-                "MutableVec::set: index {} out of bounds for len {}",
-                index, len
-            );
-        }
-    }
-
-    /// Moves an item from `old_index` to `new_index`.
-    /// Queues a `VecDiff::Move` if the indices are different and valid.
-    /// # Panics
-    /// Panics if `old_index` or `new_index` are out of bounds.
-    pub fn move_item(&mut self, old_index: usize, new_index: usize) {
-        let len = self.vec.len();
-        if old_index >= len || new_index >= len {
-            panic!(
-                "MutableVec::move_item: index out of bounds (len: {}, old: {}, new: {})",
-                len, old_index, new_index
-            );
-        }
-
-        if old_index != new_index {
-            let value = self.vec.remove(old_index);
-            self.vec.insert(new_index, value);
-            self.pending_diffs.push(VecDiff::Move {
-                old_index,
-                new_index,
-            });
-        }
-    }
-
-    /// Replaces the entire contents of the vector with the provided `values`.
-    /// Queues a `VecDiff::Replace`.
-    pub fn replace(&mut self, values: Vec<T>) {
-        self.vec = values.clone();
-        self.pending_diffs.push(VecDiff::Replace { values });
-    }
-
-    // ... Accessor Methods (len, is_empty, vec - unchanged) ...
+    // Remove the vec() method, use read() guard instead.
+    // pub fn vec(&self) -> Vec<T> { ... }
 }
 
-// Implement Deref to allow accessing slice methods directly
-impl<T> Deref for MutableVec<T>
-where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
-{
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        &self.vec
-    }
-}
-
-// Implement DerefMut to allow accessing mutable slice methods directly
-impl<T> DerefMut for MutableVec<T>
-where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + Clone,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.vec
-    }
-}
-
-// ... Default impl for MutableVec ...
+// Remove Deref/DerefMut implementations for MutableVec itself
+// impl<T> Deref for MutableVec<T> ...
+// impl<T> DerefMut for MutableVec<T> ...
