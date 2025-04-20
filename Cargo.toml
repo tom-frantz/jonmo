@@ -13,8 +13,31 @@ documentation = "https://docs.rs/jonmo"
 [dependencies]
 bevy_ecs = "0.15.3"
 bevy_reflect = "0.15.3"
+bevy_hierarchy = "0.15.3"
 bevy_log = "0.15.3"
 bevy_app = "0.15.3"
 
 [dev-dependencies]
 bevy = "0.15.3"
+rand = "0.8"
+
+[[example]]
+name = "imperatie"
+path = "examples/imperatie.rs"
+doc-scrape-examples = true
+
+[[example]]
+name = "declarative"
+path = "examples/declarative.rs"
+doc-scrape-examples = true
+
+[[example]]
+name = "lifetime_list"
+path = "examples/lifetime_list.rs"
+doc-scrape-examples = true
+
+[[example]]
+name = "utils"
+path = "examples/utils.rs"
+doc-scrape-examples = true
+crate-type = ["lib"]

@@ -48,7 +48,7 @@ fn setup_ui(world: &mut World) {
     // 2. Register the entire chain with the world.
     // No need for disambiguation now, as SignalExt::register just defines the signature
     // and the implementation comes from SignalBuilderInternal::register.
-    let _handle = signal.register(world); // Reverted to simple call
+    let _handle = Signal::register(&signal, world); // Reverted to simple call
     // The handle can be stored if cleanup is needed later: handle.cleanup(world);
 }
 
