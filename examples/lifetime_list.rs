@@ -74,12 +74,12 @@ fn item(color: Color) -> NodeBuilder {
             TextLayout::new_with_justify(JustifyText::Center),
             Lifetime::default(),
         ))
-        .component_signal_from_component(|signal| {
-            signal
-                .map(|In(Lifetime(lifetime))| Some(lifetime.round()))
-                .map(dedupe)
-                .map(|In(lifetime)| Some(Some(Text::new(format!("lifetime: {}", lifetime)))))
-        }),
+.component_signal_from_component(|signal| {
+    signal
+        .map(|In(Lifetime(lifetime))| Some(lifetime.round()))
+        .map(dedupe)
+        .map(|In(lifetime)| Some(Some(Text::new(format!("lifetime: {}", lifetime)))))
+}),
     )
 }
 
