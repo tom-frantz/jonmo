@@ -878,6 +878,11 @@ where
                         entity
                             .get_mut::<QueuedVecDiffs<T>>()
                             .map(|mut x| x.0.drain(..).collect())
+                            .and_then(
+                                |diffs: Vec<VecDiff<T>>| {
+                                    if diffs.is_empty() { None } else { Some(diffs) }
+                                },
+                            )
                     })
             }
         });

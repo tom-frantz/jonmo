@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use bevy::color::palettes::css::*;
+use bevy::prelude::*;
 use rand::seq::SliceRandom;
 
 pub(crate) static COLORS: &[Color] = &[

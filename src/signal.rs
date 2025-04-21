@@ -274,6 +274,13 @@ where
 /// to start building a signal chain.
 pub struct SignalBuilder;
 
+impl From<Entity> for Source<Entity> {
+    fn from(entity: Entity) -> Self {
+        // delegate to your existing constructor
+        SignalBuilder::from_entity(entity)
+    }
+}
+
 // Static methods to start signal chains, now associated with SignalBuilder struct
 impl SignalBuilder {
     /// Creates a signal chain starting from a custom Bevy system.

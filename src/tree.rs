@@ -1,3 +1,4 @@
+use super::node_builder::RemoveSignalHandles;
 use bevy_ecs::{prelude::*, system::SystemId};
 use bevy_log::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, PartialReflect, Typed}; // Removed unused Reflect
@@ -197,6 +198,20 @@ pub(crate) fn consume_pipe_signal(
 ) {
     for &PipeSignal(source, target) in events.read() {
         signal_propagator.add_child(source, target);
+    }
+}
+
+pub(crate) fn remove_signal_handles(world: &mut World) {
+    let remove_signal_handles = world
+        .resource_mut::<Events<RemoveSignalHandles>>()
+        .drain()
+        .collect::<Vec<_>>();
+    if !remove_signal_handles.is_empty() {
+        for RemoveSignalHandles(handles) in remove_signal_handles {
+            for handle in handles {
+                handle.cleanup(world);
+            }
+        }
     }
 }
 

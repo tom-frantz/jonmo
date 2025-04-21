@@ -3,21 +3,33 @@
 use crate::{
     prelude::*,
     register_signal,
-    signal::{Signal, /* SignalBuilderInternal, */ SignalExt, SignalHandle},
+    signal::{Signal, SignalExt, SignalHandle},
 };
-use bevy_ecs::{prelude::*, system::SystemState};
+use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
 use bevy_hierarchy::prelude::*;
-use bevy_reflect::{/* FromReflect, */ FromReflect, GetTypeRegistration, Reflect, Typed};
-use std::sync::{Arc, Mutex};
+use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
+use std::sync::{Arc, Mutex, OnceLock};
+
+fn cleanup_signal_handlers(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+    if let Ok(entity_mut) = world.get_entity(entity) {
+        if let Some(handles) = entity_mut.get::<SignalHandles>() {
+            world.send_event(RemoveSignalHandles(handles.handles.clone()));
+        }
+    }
+}
 
 /// Component storing handles to reactive systems attached to an entity.
 /// These handles are used to clean up the systems when the entity is despawned.
 #[derive(Component, Default)]
-pub struct SignalHandlers {
+#[component(on_remove = cleanup_signal_handlers)]
+pub struct SignalHandles {
     handles: Vec<SignalHandle>,
 }
 
-impl SignalHandlers {
+#[derive(Event)]
+pub(crate) struct RemoveSignalHandles(pub(crate) Vec<SignalHandle>);
+
+impl SignalHandles {
     /// Add a signal handle to the component.
     pub fn add(&mut self, handle: SignalHandle) {
         self.handles.push(handle);
@@ -65,6 +77,13 @@ impl NodeBuilder {
         })
     }
 
+    /// Sync the entity with an [`OnceLock<Entity>`].
+    pub fn entity_sync(self, entity: Arc<OnceLock<Entity>>) -> Self {
+        self.on_spawn(move |_, e| {
+            let _ = entity.set(e);
+        })
+    }
+
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
     /// The system receives the value emitted by the signal.
     /// Note: The system is registered *directly* on the builder and will be transferred
@@ -85,7 +104,7 @@ impl NodeBuilder {
             let signal = signal.map(wrapper_system);
             let handle = Signal::register(&signal, world);
             if let Ok(mut entity) = world.get_entity_mut(entity) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
+                if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
                     handlers.add(handle);
                 }
             }
@@ -94,22 +113,18 @@ impl NodeBuilder {
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
-    pub fn signal_from_entity<F, O, M>(self, system: F) -> Self
+    pub fn signal_from_entity<OS, F, O>(self, f: F) -> Self
     where
-        F: IntoSystem<In<Entity>, Option<O>, M> + Send + Sync + Clone + 'static,
+        OS: Signal<Item = O> + Send + Sync + 'static,
+        F: FnOnce(Source<Entity>) -> OS + Send + Sync + 'static,
         O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        M: Send + Sync + 'static,
     {
         let on_spawn = move |world: &mut World, entity: Entity| {
-            let system = register_signal(world, system);
-            let wrapper_system = move |In(entity): In<Entity>, world: &mut World| {
-                world.run_system_with_input(system, entity).ok()
-            };
             // TODO: reuse this entity emitting signal somehow ?
-            let signal = SignalBuilder::from_entity(entity).map(wrapper_system);
+            let signal = f(SignalBuilder::from_entity(entity));
             let handle = Signal::register(&signal, world);
             if let Ok(mut entity) = world.get_entity_mut(entity) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
+                if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
                     handlers.add(handle);
                 }
             }
@@ -118,41 +133,77 @@ impl NodeBuilder {
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
-    /// The system receives the value emitted by the signal and the entity that owns the component.
-    /// This is useful for systems that need to react to changes in a specific component of an entity.
-    /// The system will be registered on the entity's `SignalHandlers` component.
-    /// The system will be run with the entity and the component value as input.
-    /// Note: The system is registered *directly* on the builder and will be transferred
-    /// to the entity's `SignalHandlers` component upon spawning.   
-    pub fn signal_from_component<C, F, O, M>(self, system: F) -> Self
+    pub fn signal_from_component<C, OS, F, O>(self, f: F) -> Self
     where
         C: Component + Clone + FromReflect + GetTypeRegistration + Typed,
-        F: IntoSystem<In<(Entity, C)>, Option<O>, M> + Send + Sync + Clone + 'static,
+        OS: Signal<Item = O> + Send + Sync + 'static,
+        F: FnOnce(Map<Source<Entity>, C>) -> OS + Send + Sync + 'static,
         O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        M: Send + Sync + 'static,
     {
-        let on_spawn = move |world: &mut World, entity: Entity| {
-            let system = register_signal(world, system);
-            let wrapper_system = move |In(entity): In<Entity>, world: &mut World| {
-                let mut components: SystemState<Query<&C>> = SystemState::new(world);
-                if let Ok(component) = components.get(world).get(entity) {
-                    world
-                        .run_system_with_input(system, (entity, component.clone()))
-                        .ok()
-                } else {
-                    None
+        self.signal_from_entity(|signal| {
+            f(signal.map(|In(entity): In<Entity>, components: Query<&C>| {
+                components.get(entity).ok().cloned()
+            }))
+        })
+    }
+
+    /// Register a reactive system that runs when the given [`Signal`] emits a value.
+    pub fn component_signal<S, O>(self, signal: S) -> Self
+    where
+        S: Signal<Item = Option<O>> + Send + Sync + 'static,
+        O: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    {
+        self.on_signal(
+            signal,
+            move |In((entity, component_option)): In<(Entity, Option<O>)>, world: &mut World| {
+                if let Ok(mut entity) = world.get_entity_mut(entity) {
+                    if let Some(component) = component_option {
+                        entity.insert(component);
+                    } else {
+                        entity.remove::<O>();
+                    }
                 }
-            };
-            // TODO: reuse this entity emitting signal somehow ?
-            let signal = SignalBuilder::from_entity(entity).map(wrapper_system);
-            let handle = Signal::register(&signal, world);
-            if let Ok(mut entity) = world.get_entity_mut(entity) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
-                    handlers.add(handle);
-                }
-            }
-        };
-        self.on_spawn(on_spawn)
+                TERMINATE
+            },
+        )
+    }
+
+    /// Register a reactive system that runs when the given [`Signal`] emits a value.
+    pub fn component_signal_from_entity<OS, F, O>(self, f: F) -> Self
+    where
+        OS: Signal<Item = Option<O>> + Send + Sync + 'static,
+        F: FnOnce(Source<Entity>) -> OS + Send + Sync + 'static,
+        O: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    {
+        let entity = Arc::new(OnceLock::new());
+        self.entity_sync(entity.clone())
+            .signal_from_entity(move |signal| {
+                f(signal).map(move |In(component_option), world: &mut World| {
+                    if let Ok(mut entity) = world.get_entity_mut(entity.get().copied().unwrap()) {
+                        if let Some(component) = component_option {
+                            entity.insert(component);
+                        } else {
+                            entity.remove::<O>();
+                        }
+                    }
+                    TERMINATE
+                })
+            })
+    }
+
+    /// Register a reactive system that runs when the given [`Signal`] emits a value.
+    pub fn component_signal_from_component<C, OS, F, O>(self, f: F) -> Self
+    where
+        C: Component + Clone + FromReflect + GetTypeRegistration + Typed,
+        OS: Signal<Item = Option<O>> + Send + Sync + 'static,
+        F: FnOnce(Map<Source<Entity>, C>) -> OS + Send + Sync + 'static,
+        O: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    {
+        self.component_signal_from_entity(|signal| {
+            f(signal.map(|In(entity): In<Entity>, components: Query<&C>| {
+                components.get(entity).ok().cloned()
+            }))
+        })
     }
 
     /// Declare a static child node.
@@ -184,39 +235,42 @@ impl NodeBuilder {
         self.child_block_populations.lock().unwrap().push(0);
         let child_block_populations = self.child_block_populations.clone();
         let on_spawn = move |world: &mut World, parent: Entity| {
-            let system = move |In(child_option): In<T>, world: &mut World, mut existing_child_option: Local<Option<Entity>>| {
-                if let Some(child) = child_option.into() {
-                    if let Some(existing_child) = existing_child_option.take() {
-                        if let Ok(entity) = world.get_entity_mut(existing_child) {
-                            entity.despawn_recursive();
+            let system =
+                move |In(child_option): In<T>,
+                      world: &mut World,
+                      mut existing_child_option: Local<Option<Entity>>| {
+                    if let Some(child) = child_option.into() {
+                        if let Some(existing_child) = existing_child_option.take() {
+                            if let Ok(entity) = world.get_entity_mut(existing_child) {
+                                entity.despawn_recursive();
+                            }
                         }
-                    }
-                    let child_entity = world.spawn_empty().id();
-                    if let Ok(mut parent) = world.get_entity_mut(parent) {
-                        let offset = offset(block, &child_block_populations.lock().unwrap());
-                        parent.insert_children(offset, &[child_entity]);
-                        child.spawn_on_entity(world, child_entity);
-                        *existing_child_option = Some(child_entity);
+                        let child_entity = world.spawn_empty().id();
+                        if let Ok(mut parent) = world.get_entity_mut(parent) {
+                            let offset = offset(block, &child_block_populations.lock().unwrap());
+                            parent.insert_children(offset, &[child_entity]);
+                            child.spawn_on_entity(world, child_entity);
+                            *existing_child_option = Some(child_entity);
+                        } else {
+                            if let Ok(child) = world.get_entity_mut(child_entity) {
+                                child.despawn_recursive();
+                            }
+                        }
+                        child_block_populations.lock().unwrap()[block] = 1;
                     } else {
-                        if let Ok(child) = world.get_entity_mut(child_entity) {
-                            child.despawn_recursive();
+                        if let Some(existing_child) = existing_child_option.take() {
+                            if let Ok(entity) = world.get_entity_mut(existing_child) {
+                                entity.despawn_recursive();
+                            }
                         }
+                        child_block_populations.lock().unwrap()[block] = 0;
                     }
-                    child_block_populations.lock().unwrap()[block] = 1;
-                } else {
-                    if let Some(existing_child) = existing_child_option.take() {
-                        if let Ok(entity) = world.get_entity_mut(existing_child) {
-                            entity.despawn_recursive();
-                        }
-                    }
-                    child_block_populations.lock().unwrap()[block] = 0;
-                }
-                TERMINATE
-            };
+                    TERMINATE
+                };
             let signal = child_option.map(system);
             let handle = Signal::register(&signal, world);
             if let Ok(mut entity) = world.get_entity_mut(parent) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandlers>() {
+                if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
                     handlers.add(handle);
                 }
             }
@@ -277,7 +331,9 @@ impl NodeBuilder {
 
         let on_spawn = move |world: &mut World, parent: Entity| {
             // Define the system that will handle VecDiff updates
-            let system = move |In(diffs): In<Vec<VecDiff<NodeBuilder>>>, world: &mut World, mut children_entities: Local<Vec<Entity>>| {
+            let system = move |In(diffs): In<Vec<VecDiff<NodeBuilder>>>,
+                               world: &mut World,
+                               mut children_entities: Local<Vec<Entity>>| {
                 for diff in diffs {
                     match diff {
                         VecDiff::Replace { values: children } => {
@@ -348,9 +404,7 @@ impl NodeBuilder {
                             }
                         }
                         VecDiff::UpdateAt { index, value: node } => {
-                            if let Some(existing_child) =
-                                children_entities.get(index).copied()
-                            {
+                            if let Some(existing_child) = children_entities.get(index).copied() {
                                 if let Ok(child) = world.get_entity_mut(existing_child) {
                                     child.despawn_recursive(); // removes from parent
                                 }
@@ -422,9 +476,7 @@ impl NodeBuilder {
                             }
                         }
                         VecDiff::RemoveAt { index } => {
-                            if let Some(existing_child) =
-                                children_entities.get(index).copied()
-                            {
+                            if let Some(existing_child) = children_entities.get(index).copied() {
                                 if let Ok(child) = world.get_entity_mut(existing_child) {
                                     child.despawn_recursive(); // removes from parent
                                 }
@@ -459,7 +511,7 @@ impl NodeBuilder {
             let handle = SignalVec::register(&signal, world);
 
             if let Ok(mut entity_mut) = world.get_entity_mut(parent) {
-                if let Some(mut handlers) = entity_mut.get_mut::<SignalHandlers>() {
+                if let Some(mut handlers) = entity_mut.get_mut::<SignalHandles>() {
                     handlers.add(handle);
                 }
             }
@@ -474,7 +526,7 @@ impl NodeBuilder {
     pub fn spawn_on_entity(self, world: &mut World, entity: Entity) {
         if let Ok(mut entity) = world.get_entity_mut(entity) {
             let id = entity.id();
-            entity.insert(SignalHandlers::default());
+            entity.insert(SignalHandles::default());
             for on_spawn in self.on_spawns.lock().unwrap().drain(..) {
                 on_spawn(world, id);
             }

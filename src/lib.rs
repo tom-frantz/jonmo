@@ -84,6 +84,7 @@ mod signal_vec;
 mod tree; // Add signal_vec module
 // mod mutable_vec; // Remove mutable_vec module
 
+use prelude::RemoveSignalHandles;
 // Publicly export items from modules
 pub use signal::*;
 pub use signal_vec::{
@@ -91,7 +92,10 @@ pub use signal_vec::{
 };
 pub use tree::{mark_signal_root, pipe_signal, register_signal}; // Export SignalVec types
 
-use tree::{consume_mark_signal_root, consume_pipe_signal, MarkSignalRoot, PipeSignal, SignalPropagator};
+use tree::{
+    MarkSignalRoot, PipeSignal, SignalPropagator, consume_mark_signal_root, consume_pipe_signal,
+    remove_signal_handles,
+};
 
 /// System that drives signal propagation by calling [`SignalPropagator::execute`].
 /// Added to the `Update` schedule by the [`JonmoPlugin`]. This system runs once per frame.
@@ -124,12 +128,26 @@ pub struct JonmoPlugin;
 
 impl Plugin for JonmoPlugin {
     fn build(&self, app: &mut App) {
-        app
-        .init_resource::<SignalPropagator>()
-        .add_event::<MarkSignalRoot>()
-        .add_event::<PipeSignal>()
-        .add_systems(First, (consume_mark_signal_root, consume_pipe_signal).run_if(resource_exists::<SignalPropagator>))
-        .add_systems(Last, process_signals);
+        app.init_resource::<SignalPropagator>()
+            .add_event::<MarkSignalRoot>()
+            .add_event::<PipeSignal>()
+            .add_event::<RemoveSignalHandles>()
+            .add_systems(
+                First,
+                (
+                    consume_mark_signal_root.run_if(on_event::<MarkSignalRoot>),
+                    consume_pipe_signal.run_if(on_event::<PipeSignal>),
+                )
+                    .run_if(resource_exists::<SignalPropagator>),
+            )
+            .add_systems(
+                Last,
+                (
+                    remove_signal_handles.run_if(on_event::<RemoveSignalHandles>),
+                    process_signals,
+                )
+                    .chain(),
+            );
     }
 }
 

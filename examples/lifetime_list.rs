@@ -19,7 +19,10 @@ fn main() {
                 camera,
             ),
         )
-        .add_systems(Update, (live.run_if(any_with_component::<Lifetime>), hotkeys))
+        .add_systems(
+            Update,
+            (live.run_if(any_with_component::<Lifetime>), hotkeys),
+        )
         .run();
 }
 
@@ -71,18 +74,12 @@ fn item(color: Color) -> NodeBuilder {
             TextLayout::new_with_justify(JustifyText::Center),
             Lifetime::default(),
         ))
-        .signal_from_component(
-            |In((entity, Lifetime(lifetime))): In<(_, Lifetime)>, mut prev: Local<f32>, mut commands: Commands| {
-                let cur = lifetime.round();
-                if cur == 0. || cur != *prev {
-                    *prev = cur;
-                    commands
-                        .entity(entity)
-                        .insert(Text::new(format!("lifetime: {}", cur)));
-                }
-                TERMINATE
-            },
-        ),
+        .component_signal_from_component(|signal| {
+            signal
+                .map(|In(Lifetime(lifetime))| Some(lifetime.round()))
+                .map(dedupe)
+                .map(|In(lifetime)| Some(Some(Text::new(format!("lifetime: {}", lifetime)))))
+        }),
     )
 }
 
@@ -96,11 +93,7 @@ fn live(mut lifetimes: Query<&mut Lifetime>, time: Res<Time>) {
     }
 }
 
-fn hotkeys(
-    keys: Res<ButtonInput<KeyCode>>,
-    colors: ResMut<Colors>,
-    mut commands: Commands,
-) {
+fn hotkeys(keys: Res<ButtonInput<KeyCode>>, colors: ResMut<Colors>, mut commands: Commands) {
     if keys.just_pressed(KeyCode::Equal) {
         colors.0.push(random_color());
         commands.run_system_cached(flush_colors);
