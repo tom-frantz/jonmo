@@ -2430,6 +2430,7 @@ version = "0.1.4"
 dependencies = [
  "bevy",
  "bevy_app",
+ "bevy_derive",
  "bevy_ecs",
  "bevy_hierarchy",
  "bevy_log",

@@ -1,4 +1,3 @@
-#![deny(missing_docs)]
 //! # jonmo - Declarative Signals for Bevy
 //!
 //! jonmo provides a way to define reactive signal chains in Bevy using a declarative
@@ -76,7 +75,8 @@
 //! ```
 
 use bevy_app::prelude::*;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{prelude::*, system::SystemState};
+use bevy_hierarchy::prelude::*;
 // Declare modules
 mod node_builder;
 mod signal;
@@ -84,27 +84,56 @@ mod signal_vec;
 mod tree; // Add signal_vec module
 // mod mutable_vec; // Remove mutable_vec module
 
-use prelude::RemoveSignalHandles;
+use bevy_reflect::PartialReflect;
 // Publicly export items from modules
 pub use signal::*;
 pub use signal_vec::{
     MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
 };
-pub use tree::{mark_signal_root, pipe_signal, register_signal}; // Export SignalVec types
+pub use tree::{pipe_signal, register_signal}; // Export SignalVec types
 
-use tree::{
-    MarkSignalRoot, PipeSignal, SignalPropagator, consume_mark_signal_root, consume_pipe_signal,
-    remove_signal_handles,
-};
+use tree::{SignalReferenceCount, SystemRunner};
+
+fn clone_children(children: &Children) -> Vec<Entity> {
+    children.iter().cloned().collect()
+}
+
+fn process_signals_helper(
+    world: &mut World,
+    signals: impl IntoIterator<Item = Entity>,
+    input: Box<dyn PartialReflect>,
+) {
+    for signal in signals {
+        if let Some(runner) = world
+            .get_entity(signal)
+            .ok()
+            .and_then(|entity| entity.get::<SystemRunner>().cloned())
+        {
+            println!("processing orphaned parent signal with {} children", signal);
+            if let Some(output) = runner.run(world, input.clone_value()) {
+                if let Some(children) = world.get::<Children>(signal).map(clone_children) {
+                    process_signals_helper(world, children, output);
+                }
+            }
+        }
+    }
+}
 
 /// System that drives signal propagation by calling [`SignalPropagator::execute`].
 /// Added to the `Update` schedule by the [`JonmoPlugin`]. This system runs once per frame.
 /// It temporarily removes the [`SignalPropagator`] resource to allow mutable access to the `World`
 /// during system execution within the propagator.
 pub(crate) fn process_signals(world: &mut World) {
-    if let Some(propagator) = world.remove_resource::<SignalPropagator>() {
-        propagator.execute(world);
-        world.insert_resource(propagator);
+    let mut orphaned_parent_signals =
+        SystemState::<Query<&Children, (With<SystemRunner>, Without<Parent>)>>::new(world);
+    let orphaned_parent_signals = orphaned_parent_signals.get(world);
+    let orphaned_parent_signals = orphaned_parent_signals
+        .iter()
+        .map(clone_children)
+        .collect::<Vec<_>>();
+    println!("has orphaned parent signals: {}", orphaned_parent_signals.len());
+    for children in orphaned_parent_signals {
+        process_signals_helper(world, children, Box::new(()));
     }
 }
 
@@ -128,26 +157,7 @@ pub struct JonmoPlugin;
 
 impl Plugin for JonmoPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SignalPropagator>()
-            .add_event::<MarkSignalRoot>()
-            .add_event::<PipeSignal>()
-            .add_event::<RemoveSignalHandles>()
-            .add_systems(
-                First,
-                (
-                    consume_mark_signal_root.run_if(on_event::<MarkSignalRoot>),
-                    consume_pipe_signal.run_if(on_event::<PipeSignal>),
-                )
-                    .run_if(resource_exists::<SignalPropagator>),
-            )
-            .add_systems(
-                Last,
-                (
-                    remove_signal_handles.run_if(on_event::<RemoveSignalHandles>),
-                    process_signals,
-                )
-                    .chain(),
-            );
+        app.add_systems(Last, process_signals);
     }
 }
 
@@ -168,7 +178,7 @@ pub mod prelude {
         signal_vec::{
             MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
         }, // Add SignalVec to prelude
-        tree::{TERMINATE, dedupe, entity_root},
+        tree::{TERMINATE, dedupe},
     };
     // Note: SignalBuilderInternal is intentionally excluded
     // Note: Imperative functions like register_signal, pipe_signal, mark_signal_root are also excluded from prelude

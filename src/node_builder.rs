@@ -2,7 +2,6 @@
 
 use crate::{
     prelude::*,
-    register_signal,
     signal::{Signal, SignalExt, SignalHandle},
 };
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
@@ -10,10 +9,16 @@ use bevy_hierarchy::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
 use std::sync::{Arc, Mutex, OnceLock};
 
-fn cleanup_signal_handlers(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
-    if let Ok(entity_mut) = world.get_entity(entity) {
-        if let Some(handles) = entity_mut.get::<SignalHandles>() {
-            world.send_event(RemoveSignalHandles(handles.handles.clone()));
+fn cleanup_signal_handles(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+    if let Some(handles) = world.get_entity_mut(entity).ok().and_then(|mut entity| {
+        entity
+            .get_mut::<SignalHandles>()
+            .map(|mut handles| handles.0.drain(..).collect::<Vec<_>>())
+    }) {
+        for handle in handles {
+            world
+                .commands()
+                .queue(|world: &mut World| handle.cleanup(world));
         }
     }
 }
@@ -21,18 +26,21 @@ fn cleanup_signal_handlers(mut world: DeferredWorld, entity: Entity, _: Componen
 /// Component storing handles to reactive systems attached to an entity.
 /// These handles are used to clean up the systems when the entity is despawned.
 #[derive(Component, Default)]
-#[component(on_remove = cleanup_signal_handlers)]
-pub struct SignalHandles {
-    handles: Vec<SignalHandle>,
-}
-
-#[derive(Event)]
-pub(crate) struct RemoveSignalHandles(pub(crate) Vec<SignalHandle>);
+#[component(on_remove = cleanup_signal_handles)]
+pub struct SignalHandles(Vec<SignalHandle>);
 
 impl SignalHandles {
     /// Add a signal handle to the component.
     pub fn add(&mut self, handle: SignalHandle) {
-        self.handles.push(handle);
+        self.0.push(handle);
+    }
+}
+
+fn add_handle(world: &mut World, entity: Entity, handle: SignalHandle) {
+    if let Ok(mut entity) = world.get_entity_mut(entity) {
+        if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
+            handlers.add(handle);
+        }
     }
 }
 
@@ -88,46 +96,35 @@ impl NodeBuilder {
     /// The system receives the value emitted by the signal.
     /// Note: The system is registered *directly* on the builder and will be transferred
     /// to the entity's `SignalHandlers` component upon spawning.
-    pub fn on_signal<S, F, I, O, M>(self, signal: S, system: F) -> Self
+    pub fn on_signal<I, S, F, M>(self, signal: S, system: F) -> Self
     where
-        S: Signal<Item = I> + Send + Sync + 'static,
-        F: IntoSystem<In<(Entity, I)>, Option<O>, M> + Send + Sync + Clone + 'static,
         I: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        S: Signal<Item = I> + Send + Sync + 'static,
+        F: IntoSystem<In<(Entity, I)>, Option<()>, M> + Send + Sync + 'static,
         M: Send + Sync + 'static,
     {
         let on_spawn = move |world: &mut World, entity: Entity| {
-            let system = register_signal(world, system);
-            let wrapper_system = move |In(input): In<I>, world: &mut World| {
-                world.run_system_with_input(system, (entity, input)).ok()
-            };
-            let signal = signal.map(wrapper_system);
-            let handle = Signal::register(&signal, world);
-            if let Ok(mut entity) = world.get_entity_mut(entity) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
-                    handlers.add(handle);
-                }
-            }
+            let handle = Signal::register(
+                signal
+                    .map::<(Entity, I), _, _, _>(move |In(input): In<I>| (entity, input))
+                    .map::<(), _, _, _>(system),
+                world,
+            );
+            add_handle(world, entity, handle);
         };
         self.on_spawn(on_spawn)
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
-    pub fn signal_from_entity<OS, F, O>(self, f: F) -> Self
+    pub fn signal_from_entity<O, OS, F>(self, f: F) -> Self
     where
+        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         OS: Signal<Item = O> + Send + Sync + 'static,
         F: FnOnce(Source<Entity>) -> OS + Send + Sync + 'static,
-        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
     {
         let on_spawn = move |world: &mut World, entity: Entity| {
-            // TODO: reuse this entity emitting signal somehow ?
-            let signal = f(SignalBuilder::from_entity(entity));
-            let handle = Signal::register(&signal, world);
-            if let Ok(mut entity) = world.get_entity_mut(entity) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
-                    handlers.add(handle);
-                }
-            }
+            let handle = Signal::register(f(SignalBuilder::from_entity(entity)), world);
+            add_handle(world, entity, handle);
         };
         self.on_spawn(on_spawn)
     }
@@ -169,26 +166,30 @@ impl NodeBuilder {
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
-    pub fn component_signal_from_entity<OS, F, O>(self, f: F) -> Self
+    pub fn component_signal_from_entity<C, S, F>(self, f: F) -> Self
     where
-        OS: Signal<Item = Option<O>> + Send + Sync + 'static,
-        F: FnOnce(Source<Entity>) -> OS + Send + Sync + 'static,
-        O: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        C: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        S: Signal<Item = Option<C>> + Send + Sync + 'static,
+        F: FnOnce(Source<Entity>) -> S + Send + Sync + 'static,
     {
         let entity = Arc::new(OnceLock::new());
-        self.entity_sync(entity.clone())
-            .signal_from_entity(move |signal| {
-                f(signal).map(move |In(component_option), world: &mut World| {
-                    if let Ok(mut entity) = world.get_entity_mut(entity.get().copied().unwrap()) {
-                        if let Some(component) = component_option {
-                            entity.insert(component);
-                        } else {
-                            entity.remove::<O>();
+        self.entity_sync(entity.clone()).signal_from_entity(
+            move |signal| -> crate::signal::Map<_, Option<()>> {
+                f(signal).map::<_, _, _, _>(
+                    move |In(component_option): In<Option<C>>, world: &mut World| {
+                        if let Ok(mut entity) = world.get_entity_mut(entity.get().copied().unwrap())
+                        {
+                            if let Some(component) = component_option {
+                                entity.insert(component);
+                            } else {
+                                entity.remove::<C>();
+                            }
                         }
-                    }
-                    TERMINATE
-                })
-            })
+                        TERMINATE
+                    },
+                )
+            },
+        )
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
@@ -267,13 +268,9 @@ impl NodeBuilder {
                     }
                     TERMINATE
                 };
-            let signal = child_option.map(system);
-            let handle = Signal::register(&signal, world);
-            if let Ok(mut entity) = world.get_entity_mut(parent) {
-                if let Some(mut handlers) = entity.get_mut::<SignalHandles>() {
-                    handlers.add(handle);
-                }
-            }
+            let signal: Map<_, Option<()>> = child_option.map(system);
+            let handle = Signal::register(signal, world);
+            add_handle(world, parent, handle);
         };
         self.on_spawn(on_spawn)
     }
@@ -323,7 +320,7 @@ impl NodeBuilder {
     /// Declare reactive children based on a `SignalVec`.
     pub fn children_signal_vec(
         self,
-        children_signal_vec: impl SignalVec<Item = NodeBuilder> + Clone,
+        children_signal_vec: impl SignalVec<Item = NodeBuilder>,
     ) -> Self {
         let block = self.child_block_populations.lock().unwrap().len();
         self.child_block_populations.lock().unwrap().push(0); // Initial population is 0
@@ -507,16 +504,9 @@ impl NodeBuilder {
                 }
                 TERMINATE
             };
-            let signal = children_signal_vec.for_each(system);
-            let handle = SignalVec::register(&signal, world);
-
-            if let Ok(mut entity_mut) = world.get_entity_mut(parent) {
-                if let Some(mut handlers) = entity_mut.get_mut::<SignalHandles>() {
-                    handlers.add(handle);
-                }
-            }
+            let handle = SignalVec::register(children_signal_vec.for_each(system), world);
+            add_handle(world, parent, handle);
         };
-
         self.on_spawn(on_spawn)
     }
 

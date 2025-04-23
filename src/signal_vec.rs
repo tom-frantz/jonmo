@@ -1,15 +1,18 @@
-use bevy_ecs::prelude::*; // Removed unused system::SystemId
+use bevy_ecs::{prelude::*, system::SystemId};
+use bevy_log::error;
+// Removed unused system::SystemId
 use bevy_reflect::{FromReflect, GetTypeRegistration, Typed, prelude::*}; // Add reflection traits
 use std::{
     fmt,
     marker::PhantomData,
     ops::Deref,
-    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}, // Added RwLock and guards
+    sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}, // Added RwLock and guards
 };
 
 use crate::{
-    signal::SignalHandle, // Use SignalHandle::new constructor
-    tree::{UntypedSystemId, pipe_signal, register_signal}, // Removed mark_signal_root // Removed unused SignalNodeMetadata
+    register_once_signal_from_system,
+    signal::{RegisterOnceSignal, SignalHandle},
+    tree::{SignalSystem, pipe_signal, register_signal}, // Removed mark_signal_root // Removed unused SignalNodeMetadata
 };
 // Removed unused RunSystemOnce import
 // Removed unused crate::identity import
@@ -158,7 +161,7 @@ where
 ///
 /// Instead of yielding the entire `Vec` with each change, it yields [`VecDiff<T>`]
 /// describing the change. This trait combines the public concept with internal registration.
-pub trait SignalVec: Clone + Send + Sync + 'static {
+pub trait SignalVec: Send + Sync + 'static {
     /// The type of items in the vector.
     type Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static;
 
@@ -166,7 +169,7 @@ pub trait SignalVec: Clone + Send + Sync + 'static {
     /// Returns a [`SignalHandle`] containing the entities of *all* systems
     /// registered or reference-counted during this specific registration call instance.
     /// **Note:** This method is intended for internal use by the signal combinators and registration process.
-    fn register(&self, world: &mut World) -> SignalHandle;
+    fn register(self, world: &mut World) -> SignalHandle;
 }
 
 /// A source node for a `SignalVec` chain. Holds the entity ID of the registered source system.
@@ -176,7 +179,7 @@ where
     T: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     /// The entity ID of the Bevy system that acts as the source for this signal.
-    pub(crate) entity: Entity,
+    pub(crate) signal: SignalSystem,
     _marker: PhantomData<T>,
 }
 
@@ -188,55 +191,47 @@ where
     type Item = T;
 
     /// Registers the systems associated with this node. For a SourceVec, it's already registered.
-    fn register(&self, _world: &mut World) -> SignalHandle {
+    fn register(self, _world: &mut World) -> SignalHandle {
         // The system is already registered (e.g., by MutableVec::signal_vec or SignalVecBuilder::from_system)
         // We just need to return its entity ID wrapped in a handle.
-        SignalHandle::new(vec![self.entity]) // Return SignalHandle
+        SignalHandle::new(vec![self.signal]) // Return SignalHandle
     }
 }
 
-type MapVecRegisterFn = dyn Fn(
-        &mut World,
-        UntypedSystemId, // Previous system's entity ID
-    ) -> UntypedSystemId // Registered map system's entity ID
-    + Send
-    + Sync
-    + 'static;
-
 /// A map node in a `SignalVec` chain.
-pub struct MapVec<Prev, U>
+pub struct MapVec<Upstream, U>
 where
-    Prev: SignalVec, // Use consolidated SignalVec trait
+    Upstream: SignalVec, // Use consolidated SignalVec trait
     U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-    <Prev as SignalVec>::Item:
+    <Upstream as SignalVec>::Item:
         Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
-    pub(crate) prev_signal: Prev,
-    pub(crate) register_fn: Arc<MapVecRegisterFn>,
+    pub(crate) upstream: Upstream,
+    pub(crate) signal: RegisterOnceSignal,
     _marker: PhantomData<U>,
 }
 
 /// A terminal node in a `SignalVec` chain that executes a system for each batch.
-pub struct ForEachVec<Prev>
+pub struct ForEachVec<Upstream>
 where
-    Prev: SignalVec, // Use consolidated SignalVec trait
-    <Prev as SignalVec>::Item:
+    Upstream: SignalVec, // Use consolidated SignalVec trait
+    <Upstream as SignalVec>::Item:
         Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
-    pub(crate) prev_signal: Prev,
-    pub(crate) register_fn: Arc<MapVecRegisterFn>, // Re-use MapVecRegisterFn type alias
+    pub(crate) upstream: Upstream,
+    pub(crate) signal: RegisterOnceSignal, // Re-use MapVecRegisterFn type alias
 }
 
-impl<Prev> Clone for ForEachVec<Prev>
+impl<Upstream> Clone for ForEachVec<Upstream>
 where
-    Prev: SignalVec + Clone, // Use consolidated SignalVec trait
-    <Prev as SignalVec>::Item:
+    Upstream: SignalVec + Clone, // Use consolidated SignalVec trait
+    <Upstream as SignalVec>::Item:
         Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
-            prev_signal: self.prev_signal.clone(),
-            register_fn: self.register_fn.clone(),
+            upstream: self.upstream.clone(),
+            signal: self.signal.clone(),
         }
     }
 }
@@ -251,17 +246,16 @@ where
 {
     type Item = (); // Terminal node, effectively produces no further signal items
 
-    fn register(&self, world: &mut World) -> SignalHandle {
-        let prev_handle = self.prev_signal.register(world);
-        let mut all_ids = prev_handle.system_ids().to_vec();
-
-        if let Some(&prev_last_id_entity) = all_ids.last() {
-            let new_system_entity = (self.register_fn)(world, prev_last_id_entity);
-            all_ids.push(new_system_entity);
+    fn register(mut self, world: &mut World) -> SignalHandle {
+        let SignalHandle(mut lineage) = self.upstream.register(world);
+        let signal = self.signal.get(world);
+        if let Some(&parent) = lineage.last() {
+            pipe_signal(world, parent, signal);
         } else {
-            bevy_log::error!("ForEachVec signal parent registration returned empty ID list.");
+            error!("MapVec signal parent registration returned empty ID list.");
         }
-        SignalHandle::new(all_ids)
+        lineage.push(signal);
+        SignalHandle::new(lineage)
     }
 }
 
@@ -274,8 +268,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            prev_signal: self.prev_signal.clone(),
-            register_fn: self.register_fn.clone(),
+            upstream: self.upstream.clone(),
+            signal: self.signal.clone(),
             _marker: PhantomData,
         }
     }
@@ -291,17 +285,16 @@ where
 {
     type Item = U;
 
-    fn register(&self, world: &mut World) -> SignalHandle {
-        let prev_handle = self.prev_signal.register(world); // Returns SignalHandle
-        let mut all_ids = prev_handle.system_ids().to_vec(); // Get Vec<UntypedSystemId>
-
-        if let Some(&prev_last_id_entity) = all_ids.last() {
-            let new_system_entity = (self.register_fn)(world, prev_last_id_entity);
-            all_ids.push(new_system_entity);
+    fn register(mut self, world: &mut World) -> SignalHandle {
+        let SignalHandle(mut lineage) = self.upstream.register(world);
+        let signal = self.signal.get(world);
+        if let Some(&parent) = lineage.last() {
+            pipe_signal(world, parent, signal);
         } else {
-            bevy_log::error!("MapVec signal parent registration returned empty ID list.");
+            error!("MapVec signal parent registration returned empty ID list.");
         }
-        SignalHandle::new(all_ids) // Return new SignalHandle with all IDs
+        lineage.push(signal);
+        SignalHandle::new(lineage)
     }
 }
 
@@ -332,7 +325,7 @@ where
 }
 
 /// Extension trait providing combinator methods for types implementing [`SignalVec`] and [`Clone`].
-pub trait SignalVecExt: SignalVec + Clone {
+pub trait SignalVecExt: SignalVec {
     // Use consolidated SignalVec trait
     /// Creates a new `SignalVec` which maps the items within the output diffs of this `SignalVec`
     /// using the given Bevy system `F: IntoSystem<In<Self::Item>, Option<U>, M>`.
@@ -343,18 +336,17 @@ pub trait SignalVecExt: SignalVec + Clone {
     /// (like `RemoveAt`, `Move`, `Pop`, `Clear`) is preserved.
     ///
     /// The system `F` must be `Clone`, `Send`, `Sync`, and `'static`.
-    fn map<U, M, F>(self, system: F) -> MapVec<Self, U>
+    fn map<O, F, M>(self, system: F) -> MapVec<Self, O>
     // F is IntoSystem
     where
         Self: Sized,
         <Self as SignalVec>::Item:
             Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        F: IntoSystem<In<<Self as SignalVec>::Item>, U, M>
+        O: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        F: IntoSystem<In<<Self as SignalVec>::Item>, O, M>
             // F takes In<T>, returns Option<U>
             + Send
             + Sync
-            + Clone
             + 'static,
         M: Send + Sync + 'static;
 
@@ -378,81 +370,73 @@ pub trait SignalVecExt: SignalVec + Clone {
     /// Registers all the systems defined in this `SignalVec` chain into the Bevy `World`.
     ///
     /// Returns a [`SignalHandle`] for potential cleanup.
-    fn register(&self, world: &mut World) -> SignalHandle;
+    fn register(self, world: &mut World) -> SignalHandle;
 }
 
 impl<T> SignalVecExt for T
 where
-    T: SignalVec + Clone, // Use consolidated SignalVec trait
+    T: SignalVec,
 {
-    fn map<U, M, F>(self, system: F) -> MapVec<Self, U>
-    // F is IntoSystem
+    fn map<O, F, M>(self, system: F) -> MapVec<Self, O>
     where
         <T as SignalVec>::Item:
             Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        F: IntoSystem<In<<T as SignalVec>::Item>, U, M> // F takes In<T>, returns Option<U>
+        O: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        F: IntoSystem<In<<T as SignalVec>::Item>, O, M> // F takes In<T>, returns Option<U>
             + Send
             + Sync
-            + Clone
             + 'static,
         M: Send + Sync + 'static,
     {
-        // Clone the user's system for registration
-        let f_clone = system.clone();
-
-        let register_fn = Arc::new(
-            move |world: &mut World, prev_last_id_entity: UntypedSystemId| -> UntypedSystemId {
+        let signal = RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
+            move |world: &mut World| -> SignalSystem {
                 // 1. Register the user's system F to get its SystemId and Entity.
-                let user_system_id = world.register_system(f_clone.clone());
-                let user_entity = user_system_id.entity(); // Get the entity associated with F
+                let dummy = register_signal(world, system);
+                let system: SystemId<In<<T as SignalVec>::Item>, O> = SystemId::from_entity(*dummy);
 
                 // 2. Register the terminator system.
                 //    Input is Vec<VecDiff<U>>, Output is Option<T::Item>.
-                let terminator_id = register_signal::<Vec<VecDiff<U>>, <T as SignalVec>::Item, _>(
+                let terminator = register_signal::<Vec<VecDiff<O>>, <T as SignalVec>::Item, _, _, _>(
                     world,
-                    terminator_system::<<T as SignalVec>::Item, U>,
+                    terminator_system::<<T as SignalVec>::Item, O>,
                 );
-                let terminator_entity = terminator_id.entity();
 
                 // 3. Define and register the wrapper system.
                 //    Input is Vec<VecDiff<T::Item>>, Output is Option<Vec<VecDiff<U>>>.
                 let wrapper_system =
                     move |In(diff_batch): In<Vec<VecDiff<<T as SignalVec>::Item>>>, // Use SignalVec::Item
                           world: &mut World|
-                          -> Option<Vec<VecDiff<U>>> {
+                          -> Option<Vec<VecDiff<O>>> {
                         // ... (internal logic of wrapper system unchanged) ...
-                        let mut output_batch: Vec<VecDiff<U>> = Vec::new();
+                        let mut output_batch: Vec<VecDiff<O>> = Vec::new();
 
                         for diff_t in diff_batch {
-                            let maybe_diff_u: Option<VecDiff<U>> = match diff_t {
+                            let maybe_diff_u: Option<VecDiff<O>> = match diff_t {
                                 VecDiff::Replace { values } => {
-                                    let mapped_values: Vec<U> = values
+                                    let mapped_values: Vec<O> = values
                                         .into_iter()
-                                        .filter_map(|v| {
-                                            world.run_system_with_input(user_system_id, v).ok()
-                                        })
+                                        .filter_map(|v| world.run_system_with_input(system, v).ok())
                                         .collect();
                                     Some(VecDiff::Replace {
                                         values: mapped_values,
                                     })
                                 }
                                 VecDiff::InsertAt { index, value } => world
-                                    .run_system_with_input(user_system_id, value)
+                                    .run_system_with_input(system, value)
                                     .ok()
                                     .map(|mapped_value| VecDiff::InsertAt {
                                         index,
                                         value: mapped_value,
                                     }),
                                 VecDiff::UpdateAt { index, value } => world
-                                    .run_system_with_input(user_system_id, value)
+                                    .run_system_with_input(system, value)
                                     .ok()
                                     .map(|mapped_value| VecDiff::UpdateAt {
                                         index,
                                         value: mapped_value,
                                     }),
                                 VecDiff::Push { value } => world
-                                    .run_system_with_input(user_system_id, value)
+                                    .run_system_with_input(system, value)
                                     .ok()
                                     .map(|mapped_value| VecDiff::Push {
                                         value: mapped_value,
@@ -483,22 +467,20 @@ where
                     };
 
                 // Register wrapper: Input Vec<VecDiff<T>>, Output Vec<VecDiff<U>>
-                let wrapper_id = register_signal(world, wrapper_system);
-                let wrapper_entity = wrapper_id.entity();
+                let wrapper = register_signal::<_, Vec<VecDiff<O>>, _, _, _>(world, wrapper_system);
 
                 // 4. Pipe the signals together in the desired chain.
-                pipe_signal(world, prev_last_id_entity, wrapper_entity); // Previous -> Wrapper
-                pipe_signal(world, wrapper_entity, terminator_entity); // Wrapper -> Terminator
-                pipe_signal(world, terminator_entity, user_entity); // Terminator -> User System F's Entity
+                pipe_signal(world, wrapper, terminator); // Wrapper -> Terminator
+                pipe_signal(world, terminator, dummy); // Terminator -> User System F's Entity
 
                 // Return the wrapper entity as it represents the output of the map operation.
-                wrapper_entity
+                wrapper.into()
             },
-        );
+        )))));
 
         MapVec {
-            prev_signal: self,
-            register_fn,
+            upstream: self,
+            signal,
             _marker: PhantomData,
         }
     }
@@ -510,35 +492,13 @@ where
         F: IntoSystem<In<Vec<VecDiff<Self::Item>>>, Option<()>, M> + Send + Sync + Clone + 'static,
         M: Send + Sync + 'static,
     {
-        let system_clone = system.clone();
-
-        let register_fn = Arc::new(
-            move |world: &mut World, prev_last_id_entity: UntypedSystemId| -> UntypedSystemId {
-                // Register the user's system. Input: Vec<VecDiff<T::Item>>, Output: ()
-                // register_signal wraps it to return Option<()>
-                let final_system_id = register_signal::<Vec<VecDiff<<T as SignalVec>::Item>>, (), M>(
-                    world, // Pass world to register_signal
-                    system_clone.clone(),
-                );
-                let final_system_entity = final_system_id.entity();
-
-                // Pipe the previous signal's output into the user's system.
-                pipe_signal(world, prev_last_id_entity, final_system_entity); // Pass world to pipe_signal
-
-                // Return the entity of the registered user system.
-                final_system_entity
-            },
-        );
-
-        // Return the ForEachVec struct, not a SignalHandle
         ForEachVec {
-            prev_signal: self,
-            register_fn,
+            upstream: self,
+            signal: register_once_signal_from_system::<_, Option<()>, _, _, _>(system),
         }
     }
 
-    fn register(&self, world: &mut World) -> SignalHandle {
-        // Directly call the register method from the consolidated SignalVec trait
+    fn register(self, world: &mut World) -> SignalHandle {
         <T as SignalVec>::register(self, world)
     }
 }
@@ -727,7 +687,7 @@ where
 {
     vec: Vec<T>,
     pending_diffs: Vec<VecDiff<T>>,
-    listeners: Vec<UntypedSystemId>,
+    listeners: Vec<SignalSystem>,
 }
 
 /// A mutable vector that tracks changes as `VecDiff`s and sends them as a batch on `flush`.
@@ -867,17 +827,18 @@ where
         // ... (Implementation remains the same, using self.state.read/write directly) ...
         // Register the identity batch system.
         // Input is Vec<VecDiff<T>>, Output is Option<Vec<VecDiff<T>>>.
-        let source_system_id_lock = Arc::new(OnceLock::new());
-        let source_system_id = register_signal::<(), Vec<VecDiff<T>>, _>(world, {
-            let source_system_id_lock = source_system_id_lock.clone();
+        let signal_lock = Arc::new(OnceLock::new());
+        let signal = register_signal::<(), Vec<VecDiff<T>>, _, _, _>(world, {
+            let signal_lock = signal_lock.clone();
             move |_: In<()>, world: &mut World| {
+                println!("here");
                 world
-                    .get_entity_mut(source_system_id_lock.get().copied().unwrap())
+                    .get_entity_mut(signal_lock.get().copied().unwrap())
                     .ok()
                     .and_then(|mut entity: EntityWorldMut<'_>| {
                         entity
                             .get_mut::<QueuedVecDiffs<T>>()
-                            .map(|mut x| x.0.drain(..).collect())
+                            .map(|mut queued_diffs| queued_diffs.0.drain(..).collect())
                             .and_then(
                                 |diffs: Vec<VecDiff<T>>| {
                                     if diffs.is_empty() { None } else { Some(diffs) }
@@ -886,47 +847,39 @@ where
                     })
             }
         });
-        let entity = source_system_id.entity();
 
         // Initialize with Replace diff containing current state
         let initial_values = self.state.read().unwrap().vec.clone(); // Read lock to get initial values
         world
-            .entity_mut(entity)
+            .entity_mut(*signal)
             .insert(QueuedVecDiffs(vec![VecDiff::Replace {
                 values: initial_values,
             }]));
-        source_system_id_lock.set(entity).unwrap();
-
-        // Mark this system as a root for propagation
-        crate::tree::mark_signal_root(world, entity);
+        signal_lock.set(*signal).unwrap();
 
         // Add listener to the shared state
-        self.state.write().unwrap().listeners.push(entity); // Write lock to add listener
+        self.state.write().unwrap().listeners.push(signal); // Write lock to add listener
 
         SourceVec {
-            entity,
+            signal,
             _marker: PhantomData,
         }
     }
 
     /// Sends any pending `VecDiff`s accumulated since the last flush to the signal system.
     pub fn flush(&self, world: &mut World) {
-        // ... (Implementation remains the same, using self.state.write directly) ...
         let mut state = self.state.write().unwrap(); // Acquire write lock once
         if !state.pending_diffs.is_empty() {
             for &listener in &state.listeners {
-                if let Ok(mut entity) = world.get_entity_mut(listener) {
+                if let Ok(mut entity) = world.get_entity_mut(*listener) {
                     if let Some(mut queued_diffs) = entity.get_mut::<QueuedVecDiffs<T>>() {
-                        queued_diffs.0.extend(state.pending_diffs.clone()); // Clone diffs to extend
+                        queued_diffs.0.extend(state.pending_diffs.clone());
                     }
                 }
             }
             state.pending_diffs.clear();
         }
     }
-
-    // Remove the vec() method, use read() guard instead.
-    // pub fn vec(&self) -> Vec<T> { ... }
 }
 
 // Remove Deref/DerefMut implementations for MutableVec itself
