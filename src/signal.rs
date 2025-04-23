@@ -258,7 +258,6 @@ where
                 SystemRunner {
                     runner: Arc::new(Box::new(move |world, input| {
                         println!("Running system: {:?}", system);
-                        println!("type shit {}", TypeId::of::<I>() == TypeId::of::<()>());
                         match I::from_reflect(input.as_ref()) {
                             Some(input) => match world.run_system_with_input(system, input) {
                                 Ok(output) => {
@@ -336,7 +335,7 @@ impl SignalBuilder {
     where
         C: Component + FromReflect + GetTypeRegistration + Typed + Clone + Send + Sync + 'static,
     {
-        Self::from_system::<Option<C>, _, _, _>(move |_: In<()>, query: Query<&C, Changed<C>>| {
+        Self::from_system::<C, _, _, _>(move |_: In<()>, query: Query<&C, Changed<C>>| {
             query.get(entity).ok().cloned()
         })
     }
@@ -350,7 +349,7 @@ impl SignalBuilder {
     where
         R: Resource + FromReflect + GetTypeRegistration + Typed + Clone + Send + Sync + 'static,
     {
-        Self::from_system::<Option<R>, _, _, _>(move |_: In<()>, resource: Option<Res<R>>| {
+        Self::from_system::<R, _, _, _>(move |_: In<()>, resource: Option<Res<R>>| {
             resource.filter(|r| r.is_changed()).map(|r| r.clone())
         })
     }

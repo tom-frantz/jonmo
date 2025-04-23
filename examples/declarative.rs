@@ -34,12 +34,14 @@ fn setup_ui(world: &mut World) {
     // --- Signal Chain Setup (Declarative) ---
 
     // 1. Define the signal chain using the builder pattern.
-    let signal = SignalBuilder::from_component::<Value>(entity) // Use Signals::from_component
-        .map(dedupe)
-        .map(move |In(value): In<Value>, mut commands: Commands| {
+    let signal: Map<_, ()> = SignalBuilder::from_component::<Value>(entity)
+        // .map(dedupe)
+        .map(move |In(value): In<Option<Value>>, mut commands: Commands| {
             // Map the changed Value to a system that updates text
             // Update text by inserting the Text component
-            commands.entity(text).insert(Text(value.0.to_string()));
+            if let Some(value) = value {
+                commands.entity(text).insert(Text(value.0.to_string()));
+            }
             TERMINATE // Signal propagation stops after this system runs.
         });
 
@@ -48,7 +50,7 @@ fn setup_ui(world: &mut World) {
     // 2. Register the entire chain with the world.
     // No need for disambiguation now, as SignalExt::register just defines the signature
     // and the implementation comes from SignalBuilderInternal::register.
-    let _handle = Signal::register(&signal, world); // Reverted to simple call
+    let _handle = Signal::register(signal, world); // Reverted to simple call
     // The handle can be stored if cleanup is needed later: handle.cleanup(world);
 }
 

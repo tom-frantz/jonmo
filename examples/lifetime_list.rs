@@ -1,4 +1,6 @@
 mod utils;
+use std::sync::OnceLock;
+
 use utils::*;
 
 use bevy::prelude::*;
@@ -40,6 +42,7 @@ fn flush_colors(world: &mut World) {
 struct Lifetime(f32);
 
 fn ui_root(colors: impl SignalVec<Item = Color>) -> NodeBuilder {
+    // let entity = Arc::new(OnceLock::new());
     NodeBuilder::from(Node {
         height: Val::Percent(100.0),
         width: Val::Percent(100.0),
@@ -49,7 +52,22 @@ fn ui_root(colors: impl SignalVec<Item = Color>) -> NodeBuilder {
         row_gap: Val::Px(10.0),
         ..default()
     })
-    .children_signal_vec(colors.map(|In(color)| item(color)))
+    // .entity_sync(entity)
+    .child_signal(
+        SignalBuilder::from_system(|_: In<()>| {
+            NodeBuilder::from((
+                Node {
+                    height: Val::Px(40.0),
+                    width: Val::Px(200.0),
+                    padding: UiRect::all(Val::Px(5.0)),
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                BackgroundColor(Color::BLACK),
+            ))
+        })
+    )
+    // .children_signal_vec(colors.map(|In(color)| item(color)))
 }
 
 fn item(color: Color) -> NodeBuilder {
