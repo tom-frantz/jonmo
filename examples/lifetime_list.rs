@@ -1,6 +1,4 @@
 mod utils;
-use std::sync::OnceLock;
-
 use utils::*;
 
 use bevy::prelude::*;
@@ -31,19 +29,11 @@ fn main() {
 #[derive(Resource, Clone)]
 struct Colors(MutableVec<Color>);
 
-fn flush_colors(world: &mut World) {
-    if let Some(colors) = world.remove_resource::<Colors>() {
-        colors.0.flush(world);
-        world.insert_resource(colors);
-    }
-}
-
 #[derive(Component, Default, Clone, Reflect)]
 struct Lifetime(f32);
 
-fn ui_root(colors: impl SignalVec<Item = Color>) -> NodeBuilder {
-    // let entity = Arc::new(OnceLock::new());
-    NodeBuilder::from(Node {
+fn ui_root(colors: impl SignalVec<Item = Color>) -> EntityBuilder {
+    EntityBuilder::from(Node {
         height: Val::Percent(100.0),
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
@@ -52,26 +42,11 @@ fn ui_root(colors: impl SignalVec<Item = Color>) -> NodeBuilder {
         row_gap: Val::Px(10.0),
         ..default()
     })
-    // .entity_sync(entity)
-    .child_signal(
-        SignalBuilder::from_system(|_: In<()>| {
-            NodeBuilder::from((
-                Node {
-                    height: Val::Px(40.0),
-                    width: Val::Px(200.0),
-                    padding: UiRect::all(Val::Px(5.0)),
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                BackgroundColor(Color::BLACK),
-            ))
-        })
-    )
-    // .children_signal_vec(colors.map(|In(color)| item(color)))
+    .children_signal_vec(colors.map(|In(color)| item(color)))
 }
 
-fn item(color: Color) -> NodeBuilder {
-    NodeBuilder::from((
+fn item(color: Color) -> EntityBuilder {
+    EntityBuilder::from((
         Node {
             height: Val::Px(40.0),
             width: Val::Px(200.0),
@@ -82,7 +57,7 @@ fn item(color: Color) -> NodeBuilder {
         BackgroundColor(color),
     ))
     .child(
-        NodeBuilder::from((
+        EntityBuilder::from((
             Node {
                 height: Val::Percent(100.),
                 width: Val::Percent(100.),
@@ -92,12 +67,12 @@ fn item(color: Color) -> NodeBuilder {
             TextLayout::new_with_justify(JustifyText::Center),
             Lifetime::default(),
         ))
-        // .component_signal_from_component(|signal| {
-        //     signal
-        //         .map(|In(Lifetime(lifetime))| lifetime.round())
-        //         .map(dedupe)
-        //         .map(|In(lifetime): In<f32>| Some(Text::new(format!("lifetime: {}", lifetime))))
-        // }),
+        .component_signal_from_component(|signal| {
+            signal
+                .map(|In(Lifetime(lifetime))| lifetime.round())
+                .map(dedupe)
+                .map(|In(lifetime): In<f32>| Some(Text::new(format!("lifetime: {}", lifetime))))
+        }),
     )
 }
 
@@ -112,11 +87,15 @@ fn live(mut lifetimes: Query<&mut Lifetime>, time: Res<Time>) {
 }
 
 fn hotkeys(keys: Res<ButtonInput<KeyCode>>, colors: ResMut<Colors>, mut commands: Commands) {
+    let mut flush = false;
     if keys.just_pressed(KeyCode::Equal) {
         colors.0.push(random_color());
-        commands.run_system_cached(flush_colors);
+        flush = true;
     } else if keys.just_pressed(KeyCode::Minus) {
         colors.0.pop();
-        commands.run_system_cached(flush_colors);
+        flush = true;
+    }
+    if flush {
+        commands.queue(colors.0.flush());
     }
 }

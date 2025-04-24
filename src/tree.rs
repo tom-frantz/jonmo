@@ -13,17 +13,6 @@ use std::{
     },
 };
 
-/// Constant used in signal systems to indicate that the signal chain should terminate
-/// at this point for the current execution. It's equivalent to returning `None`.
-/// When a system returns `None`, the [`SignalPropagator`] stops traversing down that
-/// specific branch of the system graph for the current frame.
-///
-/// ```
-/// use jonmo::TERMINATE;
-/// assert_eq!(TERMINATE, None::<()>);
-/// ```
-pub const TERMINATE: Option<()> = None;
-
 /// A system that can be used with [`SignalExt::map`] to prevent propagation
 /// if the incoming value is the same as the previous one.
 ///
@@ -87,6 +76,13 @@ impl<I: 'static, O> From<SystemId<In<I>, O>> for SignalSystem {
     }
 }
 
+impl SignalSystem {
+    /// Returns the underlying [`Entity`] of this signal system.
+    pub fn entity(&self) -> Entity {
+        self.0
+    }
+}
+
 /// Component storing metadata for signal system nodes, primarily for reference counting.
 #[derive(Component)]
 pub(crate) struct SignalReferenceCount(i32);
@@ -111,100 +107,22 @@ impl SignalReferenceCount {
 ///
 /// Ensures the system is registered, attaches a runner component, and handles the
 /// reference counting via `SignalNodeMetadata`. Returns the `SystemId`.
-pub fn register_signal<I, O, IOO, S, M>(world: &mut World, system: S) -> SignalSystem
+pub fn register_signal<I, O, IOO, IS, M>(world: &mut World, system: IS) -> SignalSystem
 where
     I: FromReflect + Send + Sync + 'static,
     O: FromReflect + Send + Sync + 'static,
     IOO: Into<Option<O>> + Send + Sync + 'static,
-    S: IntoSystem<In<I>, IOO, M> + Send + Sync + 'static,
+    IS: IntoSystem<In<I>, IOO, M> + Send + Sync + 'static,
     M: Send + Sync + 'static,
 {
-    register_once_signal_from_system(system).get(world)
+    register_once_signal_from_system(system).register(world)
 }
 
-// pub(crate) fn remove_signal_handles(world: &mut World) {
-//     let remove_signal_handles = world
-//         .resource_mut::<Events<RemoveSignalHandles>>()
-//         .drain()
-//         .collect::<Vec<_>>();
-//     if !remove_signal_handles.is_empty() {
-//         for RemoveSignalHandles(handles) in remove_signal_handles {
-//             for handle in handles {
-//                 handle.cleanup(world);
-//             }
-//         }
-//     }
-// }
-
-/// Helper to connect two system entities in the [`SignalPropagator`] graph.
-///
-/// Establishes a parent-child relationship, indicating that the output of the `source`
-/// system should be passed as input to the `target` system during propagation.
 pub fn pipe_signal(world: &mut World, source: SignalSystem, target: SignalSystem) {
     if let Ok(mut parent) = world.get_entity_mut(*source) {
         parent.add_child(*target);
     }
 }
-
-/// Helper to register the systems needed for combining two signal branches.
-///
-/// Creates wrapper systems and a final combining system, managing reference counts
-/// and connecting them in the [`SignalPropagator`]. Returns the `SystemId` of the
-/// final combiner system and a Vec of all system entities involved in this combine step.
-// pub fn combine_signal<OLeft, ORight>(
-//     world: &mut World,
-//     left_last_entity: SignalSystemId,
-//     right_last_entity: SignalSystemId,
-// ) -> (
-//     SystemId<In<(Option<OLeft>, Option<ORight>)>, Option<(OLeft, ORight)>>,
-//     Vec<SignalSystemId>,
-// )
-// where
-//     OLeft: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-//     ORight: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-// {
-//     let left_wrapper_id = register_signal::<OLeft, (Option<OLeft>, Option<ORight>), _, _>(
-//         world,
-//         |In(left_val): In<OLeft>| Some((Some(left_val), None::<ORight>)),
-//     );
-//     pipe_signal(world, left_last_entity, left_wrapper_id.entity());
-
-//     let right_wrapper_id = register_signal::<ORight, (Option<OLeft>, Option<ORight>), _, _>(
-//         world,
-//         |In(right_val): In<ORight>| Some((None::<OLeft>, Some(right_val))),
-//     );
-//     pipe_signal(world, right_last_entity, right_wrapper_id.entity());
-
-//     let combine_id = register_signal::<_, Option<(OLeft, ORight)>, _, _>(
-//         world,
-//         move |In((left_opt, right_opt)): In<(Option<OLeft>, Option<ORight>)>,
-//               mut left_cache: Local<Option<OLeft>>,
-//               mut right_cache: Local<Option<ORight>>| {
-//             if left_opt.is_some() {
-//                 *left_cache = left_opt;
-//             }
-//             if right_opt.is_some() {
-//                 *right_cache = right_opt;
-//             }
-//             if left_cache.is_some() && right_cache.is_some() {
-//                 left_cache.take().zip(right_cache.take())
-//             } else {
-//                 None
-//             }
-//         },
-//     );
-
-//     pipe_signal(world, left_wrapper_id.entity(), combine_id.entity());
-//     pipe_signal(world, right_wrapper_id.entity(), combine_id.entity());
-
-//     let registered_entities = vec![
-//         left_wrapper_id.entity(),
-//         right_wrapper_id.entity(),
-//         combine_id.entity(),
-//     ];
-
-//     (combine_id, registered_entities)
-// }
 
 /// Component holding the type-erased system runner function.
 ///

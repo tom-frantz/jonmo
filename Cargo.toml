@@ -23,13 +23,13 @@ bevy = "0.15.3"
 rand = "0.8"
 
 [[example]]
-name = "imperative"
-path = "examples/imperative.rs"
+name = "basic"
+path = "examples/basic.rs"
 doc-scrape-examples = true
 
 [[example]]
-name = "declarative"
-path = "examples/declarative.rs"
+name = "basic_builder"
+path = "examples/basic_builder.rs"
 doc-scrape-examples = true
 
 [[example]]

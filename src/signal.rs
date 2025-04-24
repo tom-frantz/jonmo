@@ -5,7 +5,9 @@ use bevy_hierarchy::{BuildChildren, DespawnRecursiveExt};
 use bevy_log::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, PartialReflect, Typed};
 use std::{
-    any::TypeId, marker::PhantomData, sync::{Arc, Mutex}
+    any::TypeId,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Clone)]
@@ -18,7 +20,7 @@ pub(crate) enum RegisterOnceSignal {
 impl RegisterOnceSignal {
     /// Registers the system if it hasn't been registered yet.
     /// Returns the system ID of the registered system.
-    pub fn get(&mut self, world: &mut World) -> SignalSystem {
+    pub fn register(&mut self, world: &mut World) -> SignalSystem {
         match self {
             RegisterOnceSignal::System(f) => {
                 let signal = f.lock().unwrap().take().unwrap()(world).into();
@@ -74,7 +76,7 @@ pub trait Signal: Send + Sync + 'static {
     /// Returns a [`SignalHandle`] containing the entities of *all* systems
     /// registered or reference-counted during this specific registration call instance.
     /// **Note:** This method is intended for internal use by the signal combinators and registration process.
-    fn register(self, world: &mut World) -> SignalHandle; // Changed return type
+    fn register_signal(self, world: &mut World) -> SignalHandle; // Changed return type
 }
 
 // --- Signal Node Structs ---
@@ -95,8 +97,8 @@ where
 {
     type Item = O;
 
-    fn register(mut self, world: &mut World) -> SignalHandle {
-        SignalHandle::new(vec![self.signal.get(world)])
+    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+        SignalHandle::new(vec![self.signal.register(world)])
     }
 }
 
@@ -106,7 +108,7 @@ where
 pub struct Map<Upstream, O>
 where
     Upstream: Signal,
-    <Upstream as Signal>::Item: Send + Sync + 'static,
+    Upstream::Item: FromReflect + Send + Sync + 'static,
     O: Send + Sync + 'static,
 {
     pub(crate) upstream: Upstream,
@@ -117,14 +119,14 @@ where
 impl<Upstream, O> Signal for Map<Upstream, O>
 where
     Upstream: Signal,
+    Upstream::Item: FromReflect + Send + Sync + 'static,
     O: FromReflect + Send + Sync + 'static,
-    <Upstream as Signal>::Item: FromReflect + Send + Sync + 'static,
 {
     type Item = O;
 
-    fn register(mut self, world: &mut World) -> SignalHandle {
-        let SignalHandle(mut lineage) = self.upstream.register(world);
-        let signal = self.signal.get(world);
+    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+        let SignalHandle(mut lineage) = self.upstream.register_signal(world);
+        let signal = self.signal.register(world);
         if let Some(&parent) = lineage.last() {
             pipe_signal(world, parent, signal);
         } else {
@@ -135,73 +137,110 @@ where
     }
 }
 
-/// Struct representing a combine node in the signal chain definition. Implements [`Signal`].
-pub struct Combine<Left, Right>
+#[derive(Clone)]
+pub struct MapComponent<Upstream, C>
 where
-    Left: Signal,  // Use the consolidated Signal trait
-    Right: Signal, // Use the consolidated Signal trait
-    <Left as Signal>::Item: Send + Sync + 'static,
-    <Right as Signal>::Item: Send + Sync + 'static,
+    Upstream: Signal<Item = Entity>,
+    Upstream::Item: Send + Sync + 'static,
+    C: Component + Clone + Send + Sync + 'static,
 {
-    pub(crate) left_signal: Left,
-    pub(crate) right_signal: Right,
-    pub(crate) register_fn: Arc<CombineRegisterFn<<Left as Signal>::Item, <Right as Signal>::Item>>,
-    _marker: PhantomData<(<Left as Signal>::Item, <Right as Signal>::Item)>,
+    pub(crate) upstream: Upstream,
+    _marker: PhantomData<C>,
 }
 
-// Add Clone implementation for Combine
-impl<Left, Right> Clone for Combine<Left, Right>
+impl<Upstream, C> Signal for MapComponent<Upstream, C>
 where
-    Left: Signal + Clone,  // Use the consolidated Signal trait
-    Right: Signal + Clone, // Use the consolidated Signal trait
-    <Left as Signal>::Item: Send + Sync + 'static,
-    <Right as Signal>::Item: Send + Sync + 'static,
-    Arc<CombineRegisterFn<<Left as Signal>::Item, <Right as Signal>::Item>>: Clone,
+    Upstream: Signal<Item = Entity>,
+    Upstream::Item: FromReflect + Send + Sync + 'static,
+    C: Component + Clone + FromReflect + Send + Sync + 'static,
 {
-    fn clone(&self) -> Self {
-        Self {
-            left_signal: self.left_signal.clone(),
-            right_signal: self.right_signal.clone(),
-            register_fn: self.register_fn.clone(),
-            _marker: PhantomData,
+    type Item = C;
+
+    fn register_signal(self, world: &mut World) -> SignalHandle {
+        let SignalHandle(mut lineage) = self.upstream.register_signal(world);
+        let signal = register_signal::<_, C, _, _, _>(
+            world,
+            |In(entity): In<Entity>, components: Query<&C>| components.get(entity).ok().cloned(),
+        );
+        if let Some(&parent) = lineage.last() {
+            pipe_signal(world, parent, signal);
+        } else {
+            error!("MapComponent signal parent registration returned empty ID list.");
         }
+        lineage.push(signal);
+        SignalHandle::new(lineage)
     }
 }
 
-// Implement Signal for Combine<Left, Right>
-// impl<Left, Right> Signal for Combine<Left, Right>
-// where
-//     Left: Signal,  // Use the consolidated Signal trait
-//     Right: Signal, // Use the consolidated Signal trait
-//     <Left as Signal>::Item: Send + Sync + 'static,
-//     <Right as Signal>::Item: Send + Sync + 'static,
-// {
-//     type Item = (<Left as Signal>::Item, <Right as Signal>::Item);
+/// Struct representing a combine node in the signal chain definition. Implements [`Signal`].
+#[derive(Clone)]
+pub struct Combine<Left, Right>
+where
+    Left: Signal,
+    Right: Signal,
+    Left::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Right::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+{
+    pub(crate) left: Left,
+    pub(crate) right: Right,
+    _marker: PhantomData<(Left::Item, Right::Item)>,
+}
 
-//     fn register(&self, world: &mut World) -> SignalHandle {
-//         // Changed return type
-//         let left_handle = self.left_signal.register(world); // Returns SignalHandle
-//         let right_handle = self.right_signal.register(world); // Returns SignalHandle
+impl<Left, Right> Signal for Combine<Left, Right>
+where
+    Left: Signal,
+    Left::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Right: Signal,
+    Right::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+{
+    type Item = (Left::Item, Right::Item);
 
-//         let mut left_ids = left_handle.system_ids().to_vec();
-//         let mut right_ids = right_handle.system_ids().to_vec();
-
-//         let combined_ids = if let (Some(&left_last_id), Some(&right_last_id)) =
-//             (left_ids.last(), right_ids.last())
-//         {
-//             let (_combine_system_id, combine_node_ids) =
-//                 (self.register_fn)(world, left_last_id, right_last_id);
-//             combine_node_ids
-//         } else {
-//             error!("CombineSignal parent registration returned empty ID list(s).");
-//             Vec::new()
-//         };
-
-//         left_ids.append(&mut right_ids);
-//         left_ids.extend(combined_ids);
-//         SignalHandle::new(left_ids) // Wrap in SignalHandle
-//     }
-// }
+    fn register_signal(self, world: &mut World) -> SignalHandle {
+        let combiner = register_signal::<_, (Left::Item, Right::Item), _, _, _>(
+            world,
+            move |In((left_option, right_option)): In<(Option<Left::Item>, Option<Right::Item>)>,
+                    mut left_cache: Local<Option<Left::Item>>,
+                    mut right_cache: Local<Option<Right::Item>>| {
+                if left_option.is_some() {
+                    *left_cache = left_option;
+                }
+                if right_option.is_some() {
+                    *right_cache = right_option;
+                }
+                if left_cache.is_some() && right_cache.is_some() {
+                    left_cache.take().zip(right_cache.take())
+                } else {
+                    None
+                }
+            },
+        );
+        let left_wrapper = register_signal(
+            world,
+            |In(left_val): In<Left::Item>| (Some(left_val), None::<Right::Item>),
+        );
+        let right_wrapper = register_signal(
+            world,
+            |In(right): In<Right::Item>| (None::<Left::Item>, Some(right)),
+        );
+        let SignalHandle(mut left_lineage) = self.left.register_signal(world);
+        if let Some(&parent) = left_lineage.last() {
+            pipe_signal(world, parent, combiner);
+        } else {
+            error!("Combine left signal registration returned empty ID list.");
+        }
+        left_lineage.push(left_wrapper);
+        let SignalHandle(mut right_lineage) = self.right.register_signal(world);
+        if let Some(&parent) = right_lineage.last() {
+            pipe_signal(world, parent, combiner);
+        } else {
+            error!("Combine right signal registration returned empty ID list.");
+        }
+        right_lineage.push(right_wrapper);
+        left_lineage.append(&mut right_lineage);
+        left_lineage.push(combiner);
+        SignalHandle::new(left_lineage)
+    }
+}
 
 /// Handle returned by [`SignalExt::register`] used for cleaning up the registered signal chain.
 ///
@@ -239,14 +278,12 @@ impl SignalHandle {
     }
 }
 
-
-
-pub(crate) fn register_once_signal_from_system<I, O, IOO, S, M>(system: S) -> RegisterOnceSignal
+pub(crate) fn register_once_signal_from_system<I, O, IOO, IS, M>(system: IS) -> RegisterOnceSignal
 where
     I: FromReflect + Send + Sync + 'static,
     O: FromReflect + Send + Sync + 'static,
     IOO: Into<Option<O>> + Send + Sync + 'static,
-    S: IntoSystem<In<I>, IOO, M> + Send + Sync + 'static,
+    IS: IntoSystem<In<I>, IOO, M> + Send + Sync + 'static,
     M: Send + Sync + 'static,
 {
     RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
@@ -257,7 +294,6 @@ where
                 SignalReferenceCount::new(),
                 SystemRunner {
                     runner: Arc::new(Box::new(move |world, input| {
-                        println!("Running system: {:?}", system);
                         match I::from_reflect(input.as_ref()) {
                             Some(input) => match world.run_system_with_input(system, input) {
                                 Ok(output) => {
@@ -303,11 +339,11 @@ impl From<Entity> for Source<Entity> {
 
 // Static methods to start signal chains, now associated with SignalBuilder struct
 impl SignalBuilder {
-    pub fn from_system<O, IOO, S, M>(system: S) -> Source<IOO>
+    pub fn from_system<O, IOO, IS, M>(system: IS) -> Source<O>
     where
         O: FromReflect + Send + Sync + 'static,
         IOO: Into<Option<O>> + Send + Sync + 'static,
-        S: IntoSystem<In<()>, IOO, M> + Send + Sync + 'static,
+        IS: IntoSystem<In<()>, IOO, M> + Send + Sync + 'static,
         M: Send + Sync + 'static,
     {
         Source {
@@ -331,12 +367,12 @@ impl SignalBuilder {
     // /// The signal emits the new value of the component `C` whenever it changes on the entity.
     // /// Requires the component `C` to implement `Component`, `FromReflect`, `Clone`, `Send`, `Sync`, and `'static`.
     // /// Internally uses [`SignalBuilder::from_system`].
-    pub fn from_component<C>(entity: Entity) -> Source<Option<C>>
+    pub fn from_component<C>(entity: Entity) -> Source<C>
     where
         C: Component + FromReflect + GetTypeRegistration + Typed + Clone + Send + Sync + 'static,
     {
-        Self::from_system::<C, _, _, _>(move |_: In<()>, query: Query<&C, Changed<C>>| {
-            query.get(entity).ok().cloned()
+        Self::from_system(move |_: In<()>, components: Query<&C>| {
+            components.get(entity).ok().cloned()
         })
     }
 
@@ -345,11 +381,11 @@ impl SignalBuilder {
     /// The signal emits the new value of the resource `R` whenever it changes.
     /// Requires the resource `R` to implement `Resource`, `FromReflect`, `Clone`, `Send`, `Sync`, and `'static`.
     /// Internally uses [`SignalBuilder::from_system`].
-    pub fn from_resource<R>() -> Source<Option<R>>
+    pub fn from_resource<R>() -> Source<R>
     where
         R: Resource + FromReflect + GetTypeRegistration + Typed + Clone + Send + Sync + 'static,
     {
-        Self::from_system::<R, _, _, _>(move |_: In<()>, resource: Option<Res<R>>| {
+        Self::from_system(move |_: In<()>, resource: Option<Res<R>>| {
             resource.filter(|r| r.is_changed()).map(|r| r.clone())
         })
     }
@@ -366,17 +402,23 @@ pub trait SignalExt: Signal {
     ///
     /// The system `F` must be `Clone` as it's captured for registration.
     /// Returns a [`Map`] signal node.
-    fn map<O, IOO, S, M>(self, system: S) -> Map<Self, O>
+    fn map<O, IOO, IS, M>(self, system: IS) -> Map<Self, O>
     where
         Self: Sized,
-        <Self as Signal>::Item: FromReflect + Send + Sync + 'static, // Use Signal::Item
+        Self::Item: FromReflect + Send + Sync + 'static, // Use Signal::Item
         O: FromReflect + Send + Sync + 'static,
         IOO: Into<Option<O>> + Send + Sync + 'static,
-        S: IntoSystem<In<<Self as Signal>::Item>, IOO, M> // Use Signal::Item
+        IS: IntoSystem<In<Self::Item>, IOO, M> // Use Signal::Item
             + Send
             + Sync
             + 'static,
         M: Send + Sync + 'static;
+
+    fn map_component<C>(self) -> MapComponent<Self, C>
+    where
+        Self: Sized,
+        Self: Signal<Item = Entity>,
+        C: Component + Clone + FromReflect + Send + Sync + 'static;
 
     /// Combines this signal with another signal (`other`), producing a new signal that emits
     /// a tuple `(Self::Item, S2::Item)` of the outputs of both signals.
@@ -385,26 +427,24 @@ pub trait SignalExt: Signal {
     /// value since the last combined emission. It caches the latest value from each input.
     /// Both `self` and `other` must implement `Clone`.
     /// Returns a [`Combine`] signal node.
-    // fn combine_with<S2>(self, other: S2) -> Combine<Self, S2>
-    // where
-    //     Self: Sized,
-    //     S2: Signal + Clone, // Use Signal + Clone
-    //     <Self as Signal>::Item: FromReflect
-    //         + GetTypeRegistration
-    //         + Typed
-    //         + Send
-    //         + Sync
-    //         + Clone
-    //         + 'static
-    //         + std::fmt::Debug,
-    //     <S2 as Signal>::Item: FromReflect
-    //         + GetTypeRegistration
-    //         + Typed
-    //         + Send
-    //         + Sync
-    //         + Clone
-    //         + 'static
-    //         + std::fmt::Debug;
+    fn combine<Other>(self, other: Other) -> Combine<Self, Other>
+    where
+        Self: Sized,
+        Other: Signal,
+        Self::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + 'static
+            + std::fmt::Debug,
+        Other::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + 'static
+            + std::fmt::Debug;
 
     /// Registers all the systems defined in this signal chain into the Bevy `World`.
     ///
@@ -423,13 +463,12 @@ impl<T> SignalExt for T
 where
     T: Signal,
 {
-    fn map<O, IOO, S, M>(self, system: S) -> Map<Self, O>
+    fn map<O, IOO, IS, M>(self, system: IS) -> Map<Self, O>
     where
-        <T as Signal>::Item: Send + Sync + 'static,
-        <T as Signal>::Item: FromReflect + Send + Sync + 'static,
+        T::Item: FromReflect + Send + Sync + 'static,
         O: FromReflect + Send + Sync + 'static,
         IOO: Into<Option<O>> + Send + Sync + 'static,
-        S: IntoSystem<In<<T as Signal>::Item>, IOO, M> + Send + Sync + 'static,
+        IS: IntoSystem<In<T::Item>, IOO, M> + Send + Sync + 'static,
         M: Send + Sync + 'static,
     {
         Map {
@@ -439,48 +478,44 @@ where
         }
     }
 
-    // fn combine_with<S2>(self, other: S2) -> Combine<Self, S2>
-    // where
-    //     S2: Signal + Clone, // Update bounds
-    //     <Self as Signal>::Item: FromReflect
-    //         + GetTypeRegistration
-    //         + Typed
-    //         + Send
-    //         + Sync
-    //         + Clone
-    //         + 'static
-    //         + std::fmt::Debug,
-    //     <S2 as Signal>::Item: FromReflect
-    //         + GetTypeRegistration
-    //         + Typed
-    //         + Send
-    //         + Sync
-    //         + Clone
-    //         + 'static
-    //         + std::fmt::Debug,
-    // {
-    //     let register_fn = move |world: &mut World,
-    //                             left_id_entity: SignalSystemId,
-    //                             right_id_entity: SignalSystemId| {
-    //         combine_signal::<<Self as Signal>::Item, <S2 as Signal>::Item>(
-    //             // Use Signal::Item
-    //             world,
-    //             left_id_entity,
-    //             right_id_entity,
-    //         )
-    //     };
+    fn map_component<C>(self) -> MapComponent<Self, C>
+    where
+        Self: Sized,
+        Self: Signal<Item = Entity>,
+        C: Component + Clone + FromReflect + Send + Sync + 'static,
+    {
+        MapComponent {
+            upstream: self,
+            _marker: PhantomData,
+        }
+    }
 
-    //     Combine {
-    //         left_signal: self,
-    //         right_signal: other,
-    //         register_fn: Arc::new(register_fn)
-    //             as Arc<CombineRegisterFn<<Self as Signal>::Item, <S2 as Signal>::Item>>, // Use Signal::Item
-    //         _marker: PhantomData,
-    //     }
-    // }
+    fn combine<Other>(self, other: Other) -> Combine<Self, Other>
+    where
+        Other: Signal,
+        Self::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + 'static
+            + std::fmt::Debug,
+        Other::Item: FromReflect
+            + GetTypeRegistration
+            + Typed
+            + Send
+            + Sync
+            + 'static
+            + std::fmt::Debug,
+    {
+        Combine {
+            left: self,
+            right: other,
+            _marker: PhantomData,
+        }
+    }
 
     fn register(self, world: &mut World) -> SignalHandle {
-        // <T as Signal>::register now returns SignalHandle directly
-        <T as Signal>::register(self, world)
+        T::register_signal(self, world)
     }
 }
