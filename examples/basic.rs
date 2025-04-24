@@ -5,13 +5,7 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(DefaultPlugins)
         .add_plugins(JonmoPlugin)
-        .add_systems(
-            Startup,
-            (
-                ui,
-                camera,
-            ),
-        )
+        .add_systems(Startup, (ui, camera))
         .add_systems(Update, incr_value)
         .insert_resource(ValueTicker(Timer::from_seconds(1., TimerMode::Repeating)))
         .run();
@@ -28,7 +22,8 @@ fn ui(world: &mut World) {
     let signal = SignalBuilder::from_component(text)
         .map(move |In(value): In<Value>, mut commands: Commands| {
             commands.entity(text).insert(Text(value.0.to_string()));
-        }).register(world);
+        })
+        .register(world);
     let mut ui_root = world.spawn(Node {
         justify_content: JustifyContent::Center,
         align_items: AlignItems::Center,

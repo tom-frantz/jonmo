@@ -198,9 +198,12 @@ where
     fn register_signal(self, world: &mut World) -> SignalHandle {
         let combiner = register_signal::<_, (Left::Item, Right::Item), _, _, _>(
             world,
-            move |In((left_option, right_option)): In<(Option<Left::Item>, Option<Right::Item>)>,
-                    mut left_cache: Local<Option<Left::Item>>,
-                    mut right_cache: Local<Option<Right::Item>>| {
+            move |In((left_option, right_option)): In<(
+                Option<Left::Item>,
+                Option<Right::Item>,
+            )>,
+                  mut left_cache: Local<Option<Left::Item>>,
+                  mut right_cache: Local<Option<Right::Item>>| {
                 if left_option.is_some() {
                     *left_cache = left_option;
                 }
@@ -214,14 +217,12 @@ where
                 }
             },
         );
-        let left_wrapper = register_signal(
-            world,
-            |In(left_val): In<Left::Item>| (Some(left_val), None::<Right::Item>),
-        );
-        let right_wrapper = register_signal(
-            world,
-            |In(right): In<Right::Item>| (None::<Left::Item>, Some(right)),
-        );
+        let left_wrapper = register_signal(world, |In(left_val): In<Left::Item>| {
+            (Some(left_val), None::<Right::Item>)
+        });
+        let right_wrapper = register_signal(world, |In(right): In<Right::Item>| {
+            (None::<Left::Item>, Some(right))
+        });
         let SignalHandle(mut left_lineage) = self.left.register_signal(world);
         if let Some(&parent) = left_lineage.last() {
             pipe_signal(world, parent, combiner);
@@ -431,20 +432,10 @@ pub trait SignalExt: Signal {
     where
         Self: Sized,
         Other: Signal,
-        Self::Item: FromReflect
-            + GetTypeRegistration
-            + Typed
-            + Send
-            + Sync
-            + 'static
-            + std::fmt::Debug,
-        Other::Item: FromReflect
-            + GetTypeRegistration
-            + Typed
-            + Send
-            + Sync
-            + 'static
-            + std::fmt::Debug;
+        Self::Item:
+            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug,
+        Other::Item:
+            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug;
 
     /// Registers all the systems defined in this signal chain into the Bevy `World`.
     ///
@@ -493,20 +484,10 @@ where
     fn combine<Other>(self, other: Other) -> Combine<Self, Other>
     where
         Other: Signal,
-        Self::Item: FromReflect
-            + GetTypeRegistration
-            + Typed
-            + Send
-            + Sync
-            + 'static
-            + std::fmt::Debug,
-        Other::Item: FromReflect
-            + GetTypeRegistration
-            + Typed
-            + Send
-            + Sync
-            + 'static
-            + std::fmt::Debug,
+        Self::Item:
+            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug,
+        Other::Item:
+            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug,
     {
         Combine {
             left: self,

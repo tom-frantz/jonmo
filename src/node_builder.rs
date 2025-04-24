@@ -2,7 +2,8 @@
 
 use crate::{
     prelude::*,
-    signal::{Signal, SignalExt, SignalHandle}, utils::LazyEntity,
+    signal::{Signal, SignalExt, SignalHandle},
+    utils::LazyEntity,
 };
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
 use bevy_hierarchy::prelude::*;
@@ -31,7 +32,7 @@ pub struct SignalHandles(Vec<SignalHandle>);
 
 impl<T> From<T> for SignalHandles
 where
-    Vec<SignalHandle>: From<T>
+    Vec<SignalHandle>: From<T>,
 {
     #[inline]
     fn from(values: T) -> Self {
@@ -208,12 +209,11 @@ impl EntityBuilder {
         F: FnOnce(Source<Entity>) -> S + Send + Sync + 'static,
     {
         let entity = LazyEntity::new();
-        self.entity_sync(entity.clone()).signal_from_entity(
-            move |signal| {
+        self.entity_sync(entity.clone())
+            .signal_from_entity(move |signal| {
                 f(signal).map(
                     move |In(component_option): In<Option<C>>, world: &mut World| {
-                        if let Ok(mut entity) = world.get_entity_mut(entity.get())
-                        {
+                        if let Ok(mut entity) = world.get_entity_mut(entity.get()) {
                             if let Some(component) = component_option {
                                 entity.insert(component);
                             } else {
@@ -222,8 +222,7 @@ impl EntityBuilder {
                         }
                     },
                 )
-            },
-        )
+            })
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
@@ -534,7 +533,8 @@ impl EntityBuilder {
                     }
                 }
             };
-            let handle = SignalVec::register_signal_vec(children_signal_vec.for_each(system), world);
+            let handle =
+                SignalVec::register_signal_vec(children_signal_vec.for_each(system), world);
             add_handle(world, parent, handle);
         };
         self.on_spawn(on_spawn)

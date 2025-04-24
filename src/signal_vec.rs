@@ -203,8 +203,7 @@ where
 pub struct MapVec<Upstream, U>
 where
     Upstream: SignalVec, // Use consolidated SignalVec trait
-    Upstream::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Upstream::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
     U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     pub(crate) upstream: Upstream,
@@ -216,8 +215,7 @@ where
 pub struct ForEachVec<Upstream>
 where
     Upstream: SignalVec,
-    Upstream::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Upstream::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     pub(crate) upstream: Upstream,
     pub(crate) signal: RegisterOnceSignal,
@@ -226,8 +224,7 @@ where
 impl<Upstream> Clone for ForEachVec<Upstream>
 where
     Upstream: SignalVec + Clone,
-    Upstream::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Upstream::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -240,8 +237,7 @@ where
 impl<Prev> SignalVec for ForEachVec<Prev>
 where
     Prev: SignalVec,
-    Prev::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Prev::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     type Item = ();
 
@@ -261,8 +257,7 @@ where
 impl<Prev, U> Clone for MapVec<Prev, U>
 where
     Prev: SignalVec + Clone,
-    Prev::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Prev::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
     U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
@@ -278,8 +273,7 @@ where
 impl<Prev, U> SignalVec for MapVec<Prev, U>
 where
     Prev: SignalVec, // Use consolidated SignalVec trait
-    Prev::Item:
-        Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Prev::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
     U: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
 {
     type Item = U;
@@ -339,8 +333,7 @@ pub trait SignalVecExt: SignalVec {
     // F is IntoSystem
     where
         Self: Sized,
-        Self::Item:
-            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        Self::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         O: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         IS: IntoSystem<In<Self::Item>, O, M>
             // F takes In<T>, returns Option<U>
@@ -361,8 +354,7 @@ pub trait SignalVecExt: SignalVec {
     fn for_each<M, IS>(self, system: IS) -> ForEachVec<Self>
     where
         Self: Sized,
-        Self::Item:
-            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        Self::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         IS: IntoSystem<In<Vec<VecDiff<Self::Item>>>, (), M> + Send + Sync + Clone + 'static,
         M: Send + Sync + 'static;
 
@@ -378,8 +370,7 @@ where
 {
     fn map<O, IS, M>(self, system: IS) -> MapVec<Self, O>
     where
-        T::Item:
-            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        T::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         O: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         IS: IntoSystem<In<T::Item>, O, M> // F takes In<T>, returns Option<U>
             + Send
@@ -390,66 +381,65 @@ where
         let signal = RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
             move |world: &mut World| -> SignalSystem {
                 let system = world.register_system(system);
-                let wrapper_system =
-                    move |In(diff_batch): In<Vec<VecDiff<T::Item>>>,
-                          world: &mut World|
-                          -> Option<Vec<VecDiff<O>>> {
-                        let mut output_batch: Vec<VecDiff<O>> = Vec::new();
+                let wrapper_system = move |In(diff_batch): In<Vec<VecDiff<T::Item>>>,
+                                           world: &mut World|
+                      -> Option<Vec<VecDiff<O>>> {
+                    let mut output_batch: Vec<VecDiff<O>> = Vec::new();
 
-                        for diff_t in diff_batch {
-                            let maybe_diff_u: Option<VecDiff<O>> = match diff_t {
-                                VecDiff::Replace { values } => {
-                                    let mapped_values: Vec<O> = values
-                                        .into_iter()
-                                        .filter_map(|v| world.run_system_with_input(system, v).ok())
-                                        .collect();
-                                    Some(VecDiff::Replace {
-                                        values: mapped_values,
-                                    })
-                                }
-                                VecDiff::InsertAt { index, value } => world
-                                    .run_system_with_input(system, value)
-                                    .ok()
-                                    .map(|mapped_value| VecDiff::InsertAt {
-                                        index,
-                                        value: mapped_value,
-                                    }),
-                                VecDiff::UpdateAt { index, value } => world
-                                    .run_system_with_input(system, value)
-                                    .ok()
-                                    .map(|mapped_value| VecDiff::UpdateAt {
-                                        index,
-                                        value: mapped_value,
-                                    }),
-                                VecDiff::Push { value } => world
-                                    .run_system_with_input(system, value)
-                                    .ok()
-                                    .map(|mapped_value| VecDiff::Push {
-                                        value: mapped_value,
-                                    }),
-                                VecDiff::RemoveAt { index } => Some(VecDiff::RemoveAt { index }),
-                                VecDiff::Move {
-                                    old_index,
-                                    new_index,
-                                } => Some(VecDiff::Move {
-                                    old_index,
-                                    new_index,
-                                }),
-                                VecDiff::Pop => Some(VecDiff::Pop),
-                                VecDiff::Clear => Some(VecDiff::Clear),
-                            };
-
-                            if let Some(diff_u) = maybe_diff_u {
-                                output_batch.push(diff_u);
+                    for diff_t in diff_batch {
+                        let maybe_diff_u: Option<VecDiff<O>> = match diff_t {
+                            VecDiff::Replace { values } => {
+                                let mapped_values: Vec<O> = values
+                                    .into_iter()
+                                    .filter_map(|v| world.run_system_with_input(system, v).ok())
+                                    .collect();
+                                Some(VecDiff::Replace {
+                                    values: mapped_values,
+                                })
                             }
-                        }
+                            VecDiff::InsertAt { index, value } => world
+                                .run_system_with_input(system, value)
+                                .ok()
+                                .map(|mapped_value| VecDiff::InsertAt {
+                                    index,
+                                    value: mapped_value,
+                                }),
+                            VecDiff::UpdateAt { index, value } => world
+                                .run_system_with_input(system, value)
+                                .ok()
+                                .map(|mapped_value| VecDiff::UpdateAt {
+                                    index,
+                                    value: mapped_value,
+                                }),
+                            VecDiff::Push { value } => world
+                                .run_system_with_input(system, value)
+                                .ok()
+                                .map(|mapped_value| VecDiff::Push {
+                                    value: mapped_value,
+                                }),
+                            VecDiff::RemoveAt { index } => Some(VecDiff::RemoveAt { index }),
+                            VecDiff::Move {
+                                old_index,
+                                new_index,
+                            } => Some(VecDiff::Move {
+                                old_index,
+                                new_index,
+                            }),
+                            VecDiff::Pop => Some(VecDiff::Pop),
+                            VecDiff::Clear => Some(VecDiff::Clear),
+                        };
 
-                        if output_batch.is_empty() {
-                            None
-                        } else {
-                            Some(output_batch)
+                        if let Some(diff_u) = maybe_diff_u {
+                            output_batch.push(diff_u);
                         }
-                    };
+                    }
+
+                    if output_batch.is_empty() {
+                        None
+                    } else {
+                        Some(output_batch)
+                    }
+                };
                 let signal = register_signal::<_, Vec<VecDiff<O>>, _, _, _>(world, wrapper_system);
                 // just attach the system to the lifetime of the signal, it won't be forwarded results because it doesn't have a `SystemRunner`
                 // TODO: don't use the parent/child hierarchy at all for signals ...
@@ -467,8 +457,7 @@ where
 
     fn for_each<M, IS>(self, system: IS) -> ForEachVec<Self>
     where
-        T::Item:
-            Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        T::Item: Reflect + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
         IS: IntoSystem<In<Vec<VecDiff<Self::Item>>>, (), M> + Send + Sync + Clone + 'static,
         M: Send + Sync + 'static,
     {

@@ -1,5 +1,8 @@
 use bevy_ecs::prelude::*;
-use std::{ops::Deref, sync::{Arc, OnceLock}};
+use std::{
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 #[derive(Default, Clone)]
 pub struct LazyEntity(Arc<OnceLock<Entity>>);
@@ -12,7 +15,9 @@ impl LazyEntity {
 
     pub fn set(&self, entity: Entity) {
         // Set the entity in the OnceLock, panicking if it was already set
-        self.0.set(entity).expect("EntityHolder already contains an Entity");
+        self.0
+            .set(entity)
+            .expect("EntityHolder already contains an Entity");
     }
 
     /// Returns a reference to the `Entity` held by this `EntityHolder`.
