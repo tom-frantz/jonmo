@@ -70,7 +70,7 @@ fn item(color: Color) -> EntityBuilder {
         .component_signal_from_component(|signal| {
             signal
                 .map(|In(Lifetime(lifetime))| lifetime.round())
-                .map(dedupe)
+                .dedupe()
                 .map(|In(lifetime): In<f32>| Some(Text::new(format!("lifetime: {}", lifetime))))
         }),
     )

@@ -74,15 +74,18 @@
 //! }
 //! ```
 
+use std::ops::Deref;
+
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, system::SystemState};
 use bevy_hierarchy::prelude::*;
 
-mod node_builder;
+mod builder;
 mod signal;
 mod signal_vec;
 mod tree;
 pub mod utils;
+pub use builder::EntityBuilder;
 
 use bevy_reflect::PartialReflect;
 // Publicly export items from modules
@@ -92,26 +95,27 @@ pub use signal_vec::{
 };
 pub use tree::{pipe_signal, register_signal}; // Export SignalVec types
 
-use tree::SystemRunner;
+use tree::{Downstream, SignalSystem, SystemRunner, Upstream};
+use utils::SSs;
 
-fn clone_children(children: &Children) -> Vec<Entity> {
-    children.iter().cloned().collect()
+fn clone_downstream(downstream: &Downstream) -> Vec<SignalSystem> {
+    downstream.iter().cloned().collect()
 }
 
 fn process_signals_helper(
     world: &mut World,
-    signals: impl IntoIterator<Item = Entity>,
+    signals: impl IntoIterator<Item = SignalSystem>,
     input: Box<dyn PartialReflect>,
 ) {
     for signal in signals {
         if let Some(runner) = world
-            .get_entity(signal)
+            .get_entity(*signal)
             .ok()
             .and_then(|entity| entity.get::<SystemRunner>().cloned())
         {
             if let Some(output) = runner.run(world, input.clone_value()) {
-                if let Some(children) = world.get::<Children>(signal).map(clone_children) {
-                    process_signals_helper(world, children, output);
+                if let Some(downstream) = world.get::<Downstream>(*signal).map(clone_downstream) {
+                    process_signals_helper(world, downstream, output);
                 }
             }
         }
@@ -124,9 +128,9 @@ fn process_signals_helper(
 /// during system execution within the propagator.
 pub(crate) fn process_signals(world: &mut World) {
     let mut orphaned_parent_signals =
-        SystemState::<Query<Entity, (With<SystemRunner>, Without<Parent>)>>::new(world);
+        SystemState::<Query<Entity, (With<SystemRunner>, Without<Upstream>)>>::new(world);
     let orphaned_parent_signals = orphaned_parent_signals.get(world);
-    let orphaned_parent_signals = orphaned_parent_signals.iter().collect::<Vec<_>>();
+    let orphaned_parent_signals = orphaned_parent_signals.iter().map(SignalSystem).collect::<Vec<_>>();
     process_signals_helper(world, orphaned_parent_signals, Box::new(()));
 }
 
@@ -165,22 +169,20 @@ impl Plugin for JonmoPlugin {
 /// ```
 pub mod prelude {
     pub use crate::{
+        self as jonmo,
         JonmoPlugin,
-        node_builder::*,
+        builder::*,
         signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
         signal_vec::{
             MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
-        }, // Add SignalVec to prelude
-        tree::dedupe,
+        },
     };
-    // Note: SignalBuilderInternal is intentionally excluded
-    // Note: Imperative functions like register_signal, pipe_signal, mark_signal_root are also excluded from prelude
 }
 
 /// A generic identity system that takes an input `T` and returns `Some(T)`.
 /// Useful for signal graph nodes that just pass through data.
 ///
 /// Typically used with `In<T>` for Bevy system parameters.
-pub fn identity<T: Send + Sync + 'static>(In(input): In<T>) -> Option<T> {
+pub fn identity<T: SSs>(In(input): In<T>) -> Option<T> {
     Some(input)
 }

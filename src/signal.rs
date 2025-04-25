@@ -1,16 +1,15 @@
-use crate::tree::*;
+use crate::{tree::*, utils::SSs};
 use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{entity, prelude::*, system::SystemId};
-use bevy_hierarchy::{BuildChildren, DespawnRecursiveExt};
+use bevy_ecs::{entity, prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId}};
+use bevy_hierarchy::{BuildChildren, DespawnRecursiveExt, HierarchyQueryExt, Parent};
 use bevy_log::prelude::*;
-use bevy_reflect::{FromReflect, GetTypeRegistration, PartialReflect, Typed};
+use bevy_reflect::{FromReflect, GetTypeRegistration, PartialReflect, Reflect, TypePath, Typed};
 use std::{
-    any::TypeId,
-    marker::PhantomData,
-    sync::{Arc, Mutex},
+    any::TypeId, collections::VecDeque, fmt::Debug, marker::PhantomData, ops::Not, sync::{Arc, Mutex}
 };
 
-#[derive(Clone)]
+#[derive(Clone, Reflect)]
+#[reflect(opaque)]
 pub(crate) enum RegisterOnceSignal {
     // the function is just indirection required because IntoSystem isn't dyn compatible
     System(Arc<Mutex<Option<Box<dyn FnOnce(&mut World) -> SignalSystem + Send + Sync + 'static>>>>),
@@ -20,7 +19,7 @@ pub(crate) enum RegisterOnceSignal {
 impl RegisterOnceSignal {
     /// Registers the system if it hasn't been registered yet.
     /// Returns the system ID of the registered system.
-    pub fn register(&mut self, world: &mut World) -> SignalSystem {
+    pub fn get(&mut self, world: &mut World) -> SignalSystem {
         match self {
             RegisterOnceSignal::System(f) => {
                 let signal = f.lock().unwrap().take().unwrap()(world).into();
@@ -28,9 +27,11 @@ impl RegisterOnceSignal {
                 signal
             }
             RegisterOnceSignal::Registered(signal) => {
-                if let Ok(mut system) = world.get_entity_mut(**signal) {
-                    if let Some(mut ref_count) = system.get_mut::<SignalReferenceCount>() {
-                        ref_count.increment();
+                if incr {
+                    if let Ok(mut system) = world.get_entity_mut(**signal) {
+                        if let Some(mut ref_count) = system.get_mut::<SignalReferenceCount>() {
+                            ref_count.increment();
+                        }
                     }
                 }
                 *signal
@@ -54,7 +55,7 @@ type CombineRegisterFn<O1, O2> = dyn Fn(
 /// Type alias for the boxed map registration function.
 type MapRegisterFn = dyn FnOnce(
         &mut World,
-        SignalSystem, // Previous system's entity ID
+        SignalSystem, // Upstreamious system's entity ID
     ) -> SignalSystem // Registered map system's entity ID
     + Send
     + Sync
@@ -68,9 +69,9 @@ type MapRegisterFn = dyn FnOnce(
 /// created using methods on the [`SignalBuilder`] struct (e.g., [`SignalBuilder::from_component`])
 /// and then transformed or combined using methods from the [`SignalExt`] trait.
 /// This trait combines the public concept of a signal with its internal registration mechanism.
-pub trait Signal: Send + Sync + 'static {
+pub trait Signal: SSs {
     /// The type of value produced by this signal.
-    type Item: Send + Sync + 'static;
+    type Item: SSs;
 
     /// Registers the systems associated with this node and its predecessors in the `World`.
     /// Returns a [`SignalHandle`] containing the entities of *all* systems
@@ -82,10 +83,10 @@ pub trait Signal: Send + Sync + 'static {
 // --- Signal Node Structs ---
 
 /// Struct representing a source node in the signal chain definition. Implements [`Signal`].
-#[derive(Clone)]
+#[derive(Clone, Reflect)]
 pub struct Source<O>
 where
-    O: Send + Sync + 'static,
+    O: SSs,
 {
     signal: RegisterOnceSignal,
     _marker: PhantomData<O>,
@@ -93,23 +94,23 @@ where
 
 impl<O> Signal for Source<O>
 where
-    O: Clone + Send + Sync + 'static,
+    O: Clone + SSs,
 {
     type Item = O;
 
     fn register_signal(mut self, world: &mut World) -> SignalHandle {
-        SignalHandle::new(vec![self.signal.register(world)])
+        SignalHandle::new(self.signal.get(world))
     }
 }
 
 /// Struct representing a map node in the signal chain definition. Implements [`Signal`].
-/// Generic only over the previous signal (`Prev`) and the output type (`U`).
+/// Generic only over the previous signal (`Upstream`) and the output type (`U`).
 #[derive(Clone)]
 pub struct Map<Upstream, O>
 where
     Upstream: Signal,
-    Upstream::Item: FromReflect + Send + Sync + 'static,
-    O: Send + Sync + 'static,
+    Upstream::Item: FromReflect + SSs,
+    O: SSs,
 {
     pub(crate) upstream: Upstream,
     pub(crate) signal: RegisterOnceSignal,
@@ -119,21 +120,16 @@ where
 impl<Upstream, O> Signal for Map<Upstream, O>
 where
     Upstream: Signal,
-    Upstream::Item: FromReflect + Send + Sync + 'static,
-    O: FromReflect + Send + Sync + 'static,
+    Upstream::Item: FromReflect + SSs,
+    O: FromReflect + SSs,
 {
     type Item = O;
 
     fn register_signal(mut self, world: &mut World) -> SignalHandle {
-        let SignalHandle(mut lineage) = self.upstream.register_signal(world);
-        let signal = self.signal.register(world);
-        if let Some(&parent) = lineage.last() {
-            pipe_signal(world, parent, signal);
-        } else {
-            error!("Map signal parent registration returned empty ID list.");
-        }
-        lineage.push(signal);
-        SignalHandle::new(lineage)
+        let SignalHandle(upstream) = self.upstream.register(world);
+        let signal = self.signal.get(world);
+        pipe_signal(world, upstream, signal);
+        SignalHandle::new(signal)
     }
 }
 
@@ -141,34 +137,82 @@ where
 pub struct MapComponent<Upstream, C>
 where
     Upstream: Signal<Item = Entity>,
-    Upstream::Item: Send + Sync + 'static,
-    C: Component + Clone + Send + Sync + 'static,
+    Upstream::Item: SSs,
+    C: Component + Clone + SSs,
 {
-    pub(crate) upstream: Upstream,
-    _marker: PhantomData<C>,
+    pub(crate) signal: Map<Upstream, C>,
 }
 
 impl<Upstream, C> Signal for MapComponent<Upstream, C>
 where
     Upstream: Signal<Item = Entity>,
-    Upstream::Item: FromReflect + Send + Sync + 'static,
-    C: Component + Clone + FromReflect + Send + Sync + 'static,
+    Upstream::Item: FromReflect + SSs,
+    C: Component + Clone + FromReflect + SSs,
 {
     type Item = C;
 
     fn register_signal(self, world: &mut World) -> SignalHandle {
-        let SignalHandle(mut lineage) = self.upstream.register_signal(world);
-        let signal = register_signal::<_, C, _, _, _>(
-            world,
-            |In(entity): In<Entity>, components: Query<&C>| components.get(entity).ok().cloned(),
-        );
-        if let Some(&parent) = lineage.last() {
-            pipe_signal(world, parent, signal);
-        } else {
-            error!("MapComponent signal parent registration returned empty ID list.");
-        }
-        lineage.push(signal);
-        SignalHandle::new(lineage)
+        self.signal.register(world)
+    }
+}
+
+pub struct Dedupe<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+{
+    pub(crate) signal: Map<Upstream, Upstream::Item>,
+}
+
+impl<Upstream> Signal for Dedupe<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+{
+    type Item = Upstream::Item;
+
+    fn register_signal(self, world: &mut World) -> SignalHandle {
+        self.signal.register(world)
+    }
+}
+
+pub struct First<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+{
+    pub(crate) signal: Map<Upstream, Upstream::Item>,
+}
+
+impl<Upstream> Signal for First<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+{
+    type Item = Upstream::Item;
+
+    fn register_signal(self, world: &mut World) -> SignalHandle {
+        self.signal.register(world)
+    }
+}
+
+pub struct SignalDebug<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+{
+    pub(crate) signal: Map<Upstream, Upstream::Item>,
+}
+
+impl<Upstream> Signal for SignalDebug<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+{
+    type Item = Upstream::Item;
+
+    fn register_signal(self, world: &mut World) -> SignalHandle {
+        self.signal.register(world)
     }
 }
 
@@ -178,68 +222,52 @@ pub struct Combine<Left, Right>
 where
     Left: Signal,
     Right: Signal,
-    Left::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-    Right::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Left::Item: FromReflect + GetTypeRegistration + Typed + SSs,
+    Right::Item: FromReflect + GetTypeRegistration + Typed + SSs,
 {
-    pub(crate) left: Left,
-    pub(crate) right: Right,
-    _marker: PhantomData<(Left::Item, Right::Item)>,
+    pub(crate) left_wrapper: Map<Left, (Option<Left::Item>, Option<Right::Item>)>,
+    pub(crate) right_wrapper: Map<Right, (Option<Left::Item>, Option<Right::Item>)>,
+    pub(crate) signal: RegisterOnceSignal,
 }
 
 impl<Left, Right> Signal for Combine<Left, Right>
 where
     Left: Signal,
-    Left::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Left::Item: FromReflect + GetTypeRegistration + Typed + SSs,
     Right: Signal,
-    Right::Item: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+    Right::Item: FromReflect + GetTypeRegistration + Typed + SSs,
 {
     type Item = (Left::Item, Right::Item);
 
+    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+        let SignalHandle(left_upstream) = self.left_wrapper.register(world);
+        let SignalHandle(right_upstream) = self.right_wrapper.register(world);
+        let signal = self.signal.get(world);
+        pipe_signal(world, left_upstream, signal);
+        pipe_signal(world, right_upstream, signal);
+        SignalHandle::new(signal)
+    }
+}
+
+struct Flatten<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + Signal,
+    <Upstream::Item as Signal>::Item: FromReflect + SSs,
+{
+    pub(crate) signal: Map<Upstream, <Upstream::Item as Signal>::Item>,
+}
+
+impl<Upstream> Signal for Flatten<Upstream>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + Signal,
+    <Upstream::Item as Signal>::Item: FromReflect + SSs,
+{
+    type Item = <Upstream::Item as Signal>::Item;
+
     fn register_signal(self, world: &mut World) -> SignalHandle {
-        let combiner = register_signal::<_, (Left::Item, Right::Item), _, _, _>(
-            world,
-            move |In((left_option, right_option)): In<(
-                Option<Left::Item>,
-                Option<Right::Item>,
-            )>,
-                  mut left_cache: Local<Option<Left::Item>>,
-                  mut right_cache: Local<Option<Right::Item>>| {
-                if left_option.is_some() {
-                    *left_cache = left_option;
-                }
-                if right_option.is_some() {
-                    *right_cache = right_option;
-                }
-                if left_cache.is_some() && right_cache.is_some() {
-                    left_cache.take().zip(right_cache.take())
-                } else {
-                    None
-                }
-            },
-        );
-        let left_wrapper = register_signal(world, |In(left_val): In<Left::Item>| {
-            (Some(left_val), None::<Right::Item>)
-        });
-        let right_wrapper = register_signal(world, |In(right): In<Right::Item>| {
-            (None::<Left::Item>, Some(right))
-        });
-        let SignalHandle(mut left_lineage) = self.left.register_signal(world);
-        if let Some(&parent) = left_lineage.last() {
-            pipe_signal(world, parent, combiner);
-        } else {
-            error!("Combine left signal registration returned empty ID list.");
-        }
-        left_lineage.push(left_wrapper);
-        let SignalHandle(mut right_lineage) = self.right.register_signal(world);
-        if let Some(&parent) = right_lineage.last() {
-            pipe_signal(world, parent, combiner);
-        } else {
-            error!("Combine right signal registration returned empty ID list.");
-        }
-        right_lineage.push(right_wrapper);
-        left_lineage.append(&mut right_lineage);
-        left_lineage.push(combiner);
-        SignalHandle::new(left_lineage)
+        self.signal.register(world)
     }
 }
 
@@ -249,81 +277,182 @@ where
 /// that produced this handle. Dropping the handle does *not* automatically clean up.
 /// Use the [`cleanup`](SignalHandle::cleanup) method for explicit cleanup.
 #[derive(Clone, Deref, DerefMut)]
-pub struct SignalHandle(pub Vec<SignalSystem>);
+pub struct SignalHandle(pub SignalSystem);
 
-impl SignalHandle {
-    /// Creates a new SignalHandle.
-    /// This is crate-public to allow construction from other modules.
-    pub(crate) fn new(ids: Vec<SignalSystem>) -> Self {
-        Self(ids)
-    }
+pub struct UpstreamIter<'w, 's, D: QueryData, F: QueryFilter>
+where
+    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+{
+    upstreams_query: &'w Query<'w, 's, D, F>,
+    upstreams: VecDeque<SignalSystem>,
+}
 
-    /// Returns a slice containing the system IDs managed by this handle.
-    pub(crate) fn system_ids(&self) -> &[SignalSystem] {
-        &self.0
-    }
-
-    /// Decrements the reference count for each system associated with this handle.
-    /// If a system's reference count reaches zero, it removes the system's node
-    /// from the internal signal graph and despawns its associated entity from the Bevy `World`.
-    pub fn cleanup(self, world: &mut World) {
-        for &signal in &self.0 {
-            if let Ok(mut entity) = world.get_entity_mut(*signal) {
-                if let Some(mut ref_count) = entity.get_mut::<SignalReferenceCount>() {
-                    if ref_count.decrement() == 0 {
-                        entity.try_despawn_recursive();
-                    }
-                }
-            }
+impl<'w, 's, D: QueryData, F: QueryFilter> UpstreamIter<'w, 's, D, F>
+where
+    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+{
+    /// Returns a new [`DescendantIter`].
+    pub fn new(upstreams_query: &'w Query<'w, 's, D, F>, signal: SignalSystem) -> Self {
+        UpstreamIter {
+            upstreams_query,
+            upstreams: upstreams_query
+                .get(*signal)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
         }
     }
 }
 
-pub(crate) fn register_once_signal_from_system<I, O, IOO, IS, M>(system: IS) -> RegisterOnceSignal
+impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for UpstreamIter<'w, 's, D, F>
 where
-    I: FromReflect + Send + Sync + 'static,
-    O: FromReflect + Send + Sync + 'static,
-    IOO: Into<Option<O>> + Send + Sync + 'static,
-    IS: IntoSystem<In<I>, IOO, M> + Send + Sync + 'static,
-    M: Send + Sync + 'static,
+    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
 {
-    RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
-        move |world: &mut World| {
-            let system = world.register_system(system);
-            let entity = system.entity();
-            world.entity_mut(entity).insert((
-                SignalReferenceCount::new(),
-                SystemRunner {
-                    runner: Arc::new(Box::new(move |world, input| {
-                        match I::from_reflect(input.as_ref()) {
-                            Some(input) => match world.run_system_with_input(system, input) {
-                                Ok(output) => {
-                                    if let Some(output) = output.into() {
-                                        Some(Box::new(output) as Box<dyn PartialReflect>)
-                                    } else {
-                                        None // terminate
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!("error running system {:?}: {}", system, err);
-                                    None // terminate on error
-                                }
-                            },
-                            None => {
-                                warn!(
-                                    "failed to downcast input for system {:?}<{:?}>: {:?}",
-                                    system,
-                                    input.reflect_type_path(),
-                                    input
-                                );
-                                None
+    type Item = SignalSystem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let signal = self.upstreams.pop_front()?;
+
+        if let Ok(upstream) = self.upstreams_query.get(*signal) {
+            self.upstreams.extend(upstream);
+        }
+
+        Some(signal)
+    }
+}
+
+pub struct DownstreamIter<'w, 's, D: QueryData, F: QueryFilter>
+where
+    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+{
+    downstreams_query: &'w Query<'w, 's, D, F>,
+    downstreams: VecDeque<SignalSystem>,
+}
+
+impl<'w, 's, D: QueryData, F: QueryFilter> DownstreamIter<'w, 's, D, F>
+where
+    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+{
+    /// Returns a new [`DescendantIter`].
+    pub fn new(downstreams_query: &'w Query<'w, 's, D, F>, signal: SignalSystem) -> Self {
+        DownstreamIter {
+            downstreams_query,
+            downstreams: downstreams_query
+                .get(*signal)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for DownstreamIter<'w, 's, D, F>
+where
+    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+{
+    type Item = SignalSystem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let signal = self.downstreams.pop_front()?;
+
+        if let Ok(downstream) = self.downstreams_query.get(*signal) {
+            self.downstreams.extend(downstream);
+        }
+
+        Some(signal)
+    }
+}
+
+impl SignalHandle {
+    /// Creates a new SignalHandle.
+    /// This is crate-public to allow construction from other modules.
+    pub(crate) fn new(signal: SignalSystem) -> Self {
+        Self(signal)
+    }
+
+    /// decrements the ref count of this signal and all upstream signals, if the ref count reaches 0, despawns the signal and all its downstream
+    pub fn cleanup(self, world: &mut World) {
+        let signal = self.0;
+        let _ = world.run_system_once(move |upstreams: Query<&Upstream>, downstreams: Query<&Downstream>, mut ref_counts: Query<&mut SignalReferenceCount>, mut commands: Commands| {
+            for signal in [signal].into_iter().chain(UpstreamIter::new(&upstreams, signal)) {
+                if let Ok(mut ref_count) = ref_counts.get_mut(*signal) {
+                    if ref_count.decrement() == 0 {
+                        if let Some(entity) = commands.get_entity(*signal) {
+                            entity.despawn_recursive();
+                        }
+                        let mut downstream_bug = false;
+                        for downstream in DownstreamIter::new(&downstreams, signal) {
+                            downstream_bug = true;
+                            if let Some(entity) = commands.get_entity(*downstream) {
+                                entity.despawn_recursive();
                             }
                         }
-                    })),
-                },
-            ));
-            system.into()
+                        if downstream_bug {
+                            error!("downstreams should exist, this is a bug");
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+pub(crate) fn spawn_signal<I, O, IOO, IS, M>(world: &mut World, system: IS) -> SignalSystem
+where
+    I: FromReflect + SSs,
+    O: FromReflect + SSs,
+    IOO: Into<Option<O>> + SSs,
+    IS: IntoSystem<In<I>, IOO, M> + SSs,
+    M: SSs,
+{
+    let system = world.register_system(system);
+    let entity = system.entity();
+    world.entity_mut(entity).insert((
+        SignalReferenceCount::new(),
+        SystemRunner {
+            runner: Arc::new(Box::new(move |world, input| {
+                match I::from_reflect(input.as_ref()) {
+                    Some(input) => match world.run_system_with_input(system, input) {
+                        Ok(output) => {
+                            if let Some(output) = Into::<Option<O>>::into(output) {
+                                Some(Box::new(output) as Box<dyn PartialReflect>)
+                            } else {
+                                None // terminate
+                            }
+                        }
+                        Err(err) => {
+                            warn!("error running system {:?}: {}", system, err);
+                            None // terminate on error
+                        }
+                    },
+                    None => {
+                        warn!(
+                            "failed to downcast input for system {:?}<{:?}>: {:?}",
+                            system,
+                            input.reflect_type_path(),
+                            input
+                        );
+                        None
+                    }
+                }
+            })),
         },
+    ));
+    system.into()
+}
+
+pub(crate) fn register_once_signal_from_system<I, O, IOO, IS, M>(system: IS) -> RegisterOnceSignal
+where
+    I: FromReflect + SSs,
+    O: FromReflect + SSs,
+    IOO: Into<Option<O>> + SSs,
+    IS: IntoSystem<In<I>, IOO, M> + SSs,
+    M: SSs,
+{
+    RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
+        move |world: &mut World| spawn_signal(world, system)
     )))))
 }
 
@@ -342,10 +471,10 @@ impl From<Entity> for Source<Entity> {
 impl SignalBuilder {
     pub fn from_system<O, IOO, IS, M>(system: IS) -> Source<O>
     where
-        O: FromReflect + Send + Sync + 'static,
-        IOO: Into<Option<O>> + Send + Sync + 'static,
-        IS: IntoSystem<In<()>, IOO, M> + Send + Sync + 'static,
-        M: Send + Sync + 'static,
+        O: FromReflect + SSs,
+        IOO: Into<Option<O>> + SSs,
+        IS: IntoSystem<In<()>, IOO, M> + SSs,
+        M: SSs,
     {
         Source {
             signal: register_once_signal_from_system(system),
@@ -370,7 +499,7 @@ impl SignalBuilder {
     // /// Internally uses [`SignalBuilder::from_system`].
     pub fn from_component<C>(entity: Entity) -> Source<C>
     where
-        C: Component + FromReflect + GetTypeRegistration + Typed + Clone + Send + Sync + 'static,
+        C: Component + FromReflect + GetTypeRegistration + Typed + Clone + SSs,
     {
         Self::from_system(move |_: In<()>, components: Query<&C>| {
             components.get(entity).ok().cloned()
@@ -384,7 +513,7 @@ impl SignalBuilder {
     /// Internally uses [`SignalBuilder::from_system`].
     pub fn from_resource<R>() -> Source<R>
     where
-        R: Resource + FromReflect + GetTypeRegistration + Typed + Clone + Send + Sync + 'static,
+        R: Resource + FromReflect + GetTypeRegistration + Typed + Clone + SSs,
     {
         Self::from_system(move |_: In<()>, resource: Option<Res<R>>| {
             resource.filter(|r| r.is_changed()).map(|r| r.clone())
@@ -406,20 +535,30 @@ pub trait SignalExt: Signal {
     fn map<O, IOO, IS, M>(self, system: IS) -> Map<Self, O>
     where
         Self: Sized,
-        Self::Item: FromReflect + Send + Sync + 'static, // Use Signal::Item
-        O: FromReflect + Send + Sync + 'static,
-        IOO: Into<Option<O>> + Send + Sync + 'static,
-        IS: IntoSystem<In<Self::Item>, IOO, M> // Use Signal::Item
+        Self::Item: FromReflect + SSs,
+        O: FromReflect + SSs,
+        IOO: Into<Option<O>> + SSs,
+        IS: IntoSystem<In<Self::Item>, IOO, M>
             + Send
             + Sync
             + 'static,
-        M: Send + Sync + 'static;
+        M: SSs;
 
     fn map_component<C>(self) -> MapComponent<Self, C>
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
-        C: Component + Clone + FromReflect + Send + Sync + 'static;
+        C: Component + Clone + FromReflect + SSs;
+
+    fn dedupe(self) -> Dedupe<Self>
+    where
+        Self: Sized,
+        Self::Item: PartialEq + Clone + FromReflect + SSs;
+
+    fn first(self) -> First<Self>
+    where
+        Self: Sized,
+        Self::Item: FromReflect + SSs;
 
     /// Combines this signal with another signal (`other`), producing a new signal that emits
     /// a tuple `(Self::Item, S2::Item)` of the outputs of both signals.
@@ -433,9 +572,22 @@ pub trait SignalExt: Signal {
         Self: Sized,
         Other: Signal,
         Self::Item:
-            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug,
+            FromReflect + GetTypeRegistration + Typed + SSs,
         Other::Item:
-            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug;
+            FromReflect + GetTypeRegistration + Typed + SSs;
+    
+    fn flatten(self) -> Flatten<Self>
+    where
+        Self: Sized,
+        Self::Item: FromReflect + Signal + Clone,
+        <Self::Item as Signal>::Item: FromReflect + SSs;
+
+    /// Adds a debug step to the signal chain that prints the value of the signal
+    /// whenever it changes.
+    fn debug(self) -> SignalDebug<Self>
+    where
+        Self: Sized,
+        Self::Item: Debug + FromReflect + SSs;
 
     /// Registers all the systems defined in this signal chain into the Bevy `World`.
     ///
@@ -456,11 +608,11 @@ where
 {
     fn map<O, IOO, IS, M>(self, system: IS) -> Map<Self, O>
     where
-        T::Item: FromReflect + Send + Sync + 'static,
-        O: FromReflect + Send + Sync + 'static,
-        IOO: Into<Option<O>> + Send + Sync + 'static,
-        IS: IntoSystem<In<T::Item>, IOO, M> + Send + Sync + 'static,
-        M: Send + Sync + 'static,
+        T::Item: FromReflect + SSs,
+        O: FromReflect + SSs,
+        IOO: Into<Option<O>> + SSs,
+        IS: IntoSystem<In<T::Item>, IOO, M> + SSs,
+        M: SSs,
     {
         Map {
             upstream: self,
@@ -473,11 +625,52 @@ where
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
-        C: Component + Clone + FromReflect + Send + Sync + 'static,
+        C: Component + Clone + FromReflect + SSs,
     {
         MapComponent {
-            upstream: self,
-            _marker: PhantomData,
+            signal: self.map(|In(entity): In<Entity>, components: Query<&C>| components.get(entity).ok().cloned())
+        }
+    }
+
+    fn dedupe(self) -> Dedupe<Self>
+        where
+            Self: Sized,
+            Self::Item: PartialEq + Clone + FromReflect + SSs {
+        Dedupe {
+            signal: self.map(|In(current): In<Self::Item>, mut cache: Local<Option<Self::Item>>| {
+                let mut changed = false;
+                if let Some(ref p) = *cache {
+                    if *p != current {
+                        changed = true;
+                    }
+                } else {
+                    changed = true;
+                }
+            
+                if changed {
+                    *cache = Some(current.clone());
+                    Some(current)
+                } else {
+                    None
+                }
+            })
+        }
+    }
+
+    fn first(self) -> First<Self>
+    where
+        Self: Sized,
+        Self::Item: FromReflect + SSs,
+    {
+        First {
+            signal: self.map(|In(item): In<Self::Item>, mut first: Local<bool>| {
+                if *first {
+                    None
+                } else {
+                    *first = true;
+                    Some(item)
+                }
+            }),
         }
     }
 
@@ -485,14 +678,81 @@ where
     where
         Other: Signal,
         Self::Item:
-            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug,
+            FromReflect + GetTypeRegistration + Typed + SSs,
         Other::Item:
-            FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static + std::fmt::Debug,
+            FromReflect + GetTypeRegistration + Typed + SSs,
     {
+        let left_wrapper = self.map(|In(left): In<Self::Item>| {
+            (Some(left), None::<Other::Item>)
+        });
+        let right_wrapper = other.map(|In(right): In<Other::Item>| {
+            (None::<Self::Item>, Some(right))
+        });
+        let signal = register_once_signal_from_system::<_, (Self::Item, Other::Item), _, _, _>(
+            move |In((left_option, right_option)): In<(
+                Option<Self::Item>,
+                Option<Other::Item>,
+            )>,
+                  mut left_cache: Local<Option<Self::Item>>,
+                  mut right_cache: Local<Option<Other::Item>>| {
+                if left_option.is_some() {
+                    *left_cache = left_option;
+                }
+                if right_option.is_some() {
+                    *right_cache = right_option;
+                }
+                if left_cache.is_some() && right_cache.is_some() {
+                    left_cache.take().zip(right_cache.take())
+                } else {
+                    None
+                }
+            },
+        );
         Combine {
-            left: self,
-            right: other,
-            _marker: PhantomData,
+            left_wrapper,
+            right_wrapper,
+            signal,
+        }
+    }
+
+    fn flatten(self) -> Flatten<Self>
+    where
+        Self: Sized,
+        Self::Item: FromReflect + Signal + Clone,
+        <Self::Item as Signal>::Item: FromReflect + SSs,
+    {
+        // TODO: forward with observer instead of mutex ?
+        let cur = Arc::new(Mutex::new(None));
+        Flatten { signal: self.map(move |In(signal): In<Self::Item>, world: &mut World, mut prev_system_option: Local<Option<(SignalSystem, SignalHandle)>>| {
+            // TODO: is this registering/cleanup too expensive ?
+            let signal_handle = signal.clone().register(world);
+            let cur_system = signal_handle.0;
+            signal_handle.cleanup(world);
+            if prev_system_option.as_ref().is_some_and(|&(prev_system, _)| prev_system == cur_system).not() {
+                if let Some((_, prev_forwarder)) = prev_system_option.take() {
+                    prev_forwarder.cleanup(world);
+                }
+                let cur_clone = cur.clone();
+                let forwarder = signal.map(move |In(item)| {
+                    *cur_clone.lock().unwrap() = Some(item);
+                });
+                forwarder.register(world);
+            }
+            cur.lock().unwrap().take()
+        }) }
+    }
+
+    fn debug(self) -> SignalDebug<Self>
+    where
+        Self: Sized,
+        Self::Item: Debug + FromReflect + SSs,
+    {
+        let location = std::panic::Location::caller();
+        SignalDebug {
+            signal: self.map(move |In(item): In<Self::Item>| {
+                debug!("[{}] {:#?}", location, item);
+                item
+            }),
         }
     }
 

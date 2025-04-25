@@ -3,7 +3,7 @@
 use crate::{
     prelude::*,
     signal::{Signal, SignalExt, SignalHandle},
-    utils::LazyEntity,
+    utils::{LazyEntity, SSs},
 };
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
 use bevy_hierarchy::prelude::*;
@@ -81,7 +81,7 @@ impl EntityBuilder {
     /// immediately after the entity is spawned, but before signal systems are fully registered.
     pub fn on_spawn(
         self, // Remove mut
-        on_spawn: impl FnOnce(&mut World, Entity) + Send + Sync + 'static,
+        on_spawn: impl FnOnce(&mut World, Entity) + SSs,
     ) -> Self {
         self.on_spawns.lock().unwrap().push(Box::new(on_spawn)); // Direct access
         self
@@ -109,10 +109,10 @@ impl EntityBuilder {
     /// to the entity's `SignalHandlers` component upon spawning.
     pub fn on_signal<I, S, IS, M>(self, signal: S, system: IS) -> Self
     where
-        I: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        S: Signal<Item = I> + Send + Sync + 'static,
-        IS: IntoSystem<In<(Entity, I)>, (), M> + Send + Sync + 'static,
-        M: Send + Sync + 'static,
+        I: FromReflect + GetTypeRegistration + Typed + SSs,
+        S: Signal<Item = I> + SSs,
+        IS: IntoSystem<In<(Entity, I)>, (), M> + SSs,
+        M: SSs,
     {
         let on_spawn = move |world: &mut World, entity: Entity| {
             let handle = Signal::register_signal(
@@ -129,9 +129,9 @@ impl EntityBuilder {
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
     pub fn signal_from_entity<O, OS, F>(self, f: F) -> Self
     where
-        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        OS: Signal<Item = O> + Send + Sync + 'static,
-        F: FnOnce(Source<Entity>) -> OS + Send + Sync + 'static,
+        O: FromReflect + GetTypeRegistration + Typed + SSs,
+        OS: Signal<Item = O> + SSs,
+        F: FnOnce(Source<Entity>) -> OS + SSs,
     {
         let on_spawn = move |world: &mut World, entity: Entity| {
             let handle = Signal::register_signal(f(SignalBuilder::from_entity(entity)), world);
@@ -144,9 +144,9 @@ impl EntityBuilder {
     pub fn signal_from_component<C, OS, F, O>(self, f: F) -> Self
     where
         C: Component + Clone + FromReflect + GetTypeRegistration + Typed,
-        OS: Signal<Item = O> + Send + Sync + 'static,
-        F: FnOnce(Map<Source<Entity>, C>) -> OS + Send + Sync + 'static,
-        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        OS: Signal<Item = O> + SSs,
+        F: FnOnce(Map<Source<Entity>, C>) -> OS + SSs,
+        O: FromReflect + GetTypeRegistration + Typed + SSs,
     {
         self.signal_from_entity(|signal| {
             f(signal.map(|In(entity): In<Entity>, components: Query<&C>| {
@@ -157,9 +157,9 @@ impl EntityBuilder {
 
     pub fn signal_from_ancestor<O, OS, F>(self, generations: usize, f: F) -> Self
     where
-        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        OS: Signal<Item = O> + Send + Sync + 'static,
-        F: FnOnce(Map<Source<Entity>, Entity>) -> OS + Send + Sync + 'static,
+        O: FromReflect + GetTypeRegistration + Typed + SSs,
+        OS: Signal<Item = O> + SSs,
+        F: FnOnce(Map<Source<Entity>, Entity>) -> OS + SSs,
     {
         self.signal_from_entity(move |signal| {
             f(
@@ -174,9 +174,9 @@ impl EntityBuilder {
 
     pub fn signal_from_parent<O, OS, F>(self, f: F) -> Self
     where
-        O: FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        OS: Signal<Item = O> + Send + Sync + 'static,
-        F: FnOnce(Map<Source<Entity>, Entity>) -> OS + Send + Sync + 'static,
+        O: FromReflect + GetTypeRegistration + Typed + SSs,
+        OS: Signal<Item = O> + SSs,
+        F: FnOnce(Map<Source<Entity>, Entity>) -> OS + SSs,
     {
         self.signal_from_ancestor(1, f)
     }
@@ -184,8 +184,8 @@ impl EntityBuilder {
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
     pub fn component_signal<S, O>(self, signal: S) -> Self
     where
-        S: Signal<Item = Option<O>> + Send + Sync + 'static,
-        O: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        S: Signal<Item = Option<O>> + SSs,
+        O: Component + FromReflect + GetTypeRegistration + Typed + SSs,
     {
         self.on_signal(
             signal,
@@ -204,9 +204,9 @@ impl EntityBuilder {
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
     pub fn component_signal_from_entity<C, S, F>(self, f: F) -> Self
     where
-        C: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
-        S: Signal<Item = Option<C>> + Send + Sync + 'static,
-        F: FnOnce(Source<Entity>) -> S + Send + Sync + 'static,
+        C: Component + FromReflect + GetTypeRegistration + Typed + SSs,
+        S: Signal<Item = Option<C>> + SSs,
+        F: FnOnce(Source<Entity>) -> S + SSs,
     {
         let entity = LazyEntity::new();
         self.entity_sync(entity.clone())
@@ -229,9 +229,9 @@ impl EntityBuilder {
     pub fn component_signal_from_component<C, OS, F, O>(self, f: F) -> Self
     where
         C: Component + Clone + FromReflect + GetTypeRegistration + Typed,
-        OS: Signal<Item = Option<O>> + Send + Sync + 'static,
-        F: FnOnce(Map<Source<Entity>, C>) -> OS + Send + Sync + 'static,
-        O: Component + FromReflect + GetTypeRegistration + Typed + Send + Sync + 'static,
+        OS: Signal<Item = Option<O>> + SSs,
+        F: FnOnce(Map<Source<Entity>, C>) -> OS + SSs,
+        O: Component + FromReflect + GetTypeRegistration + Typed + SSs,
     {
         self.component_signal_from_entity(|signal| {
             f(signal.map(|In(entity): In<Entity>, components: Query<&C>| {
@@ -263,7 +263,7 @@ impl EntityBuilder {
     /// Declare a reactive child. When the [`Signal`] outputs [`None`], the child is removed.
     pub fn child_signal<T: Into<Option<EntityBuilder>> + FromReflect>(
         self,
-        child_option: impl Signal<Item = T> + Send + Sync + 'static,
+        child_option: impl Signal<Item = T> + SSs,
     ) -> Self {
         let block = self.child_block_populations.lock().unwrap().len();
         self.child_block_populations.lock().unwrap().push(0);
