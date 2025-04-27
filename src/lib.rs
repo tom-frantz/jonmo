@@ -28,57 +28,9 @@
 //!
 //! The signal propagation is managed internally by the [`JonmoPlugin`] which should be added
 //! to your Bevy `App`.
-//!
-//! ## Example
-//!
-//! ```no_run
-//! use bevy::prelude::*;
-//! use jonmo::prelude::*; // Import prelude for common items
-//!
-//! #[derive(Component, Reflect, Clone, Default, PartialEq)]
-//! #[reflect(Component)]
-//! struct Value(i32);
-//!
-//! #[derive(Resource)]
-//! struct UiEntities { main: Entity, text: Entity }
-//!
-//! fn setup_ui_declarative(world: &mut World) {
-//!     // Assume ui_entities resource is populated
-//!     let ui_entities = world.get_resource::<UiEntities>().unwrap();
-//!     let entity = ui_entities.main;
-//!     let text = ui_entities.text;
-//!
-//!     let text_node = text.clone(); // Clone for closure
-//!     let signal_chain = SignalBuilder::from_component::<Value>(entity) // Start from Value component changes
-//!         .map(dedupe) // Only propagate if the value is different from the last
-//!         .map(move |In(value): In<Value>, mut cmd: Commands| { // Update text when value changes
-//!             println!("Updating text with Value: {}", value.0);
-//!             cmd.entity(text_node).insert(Text::from_section(value.0.to_string(), Default::default())); // Assuming Text setup
-//!             TERMINATE // Signal ends here for this frame's execution path.
-//!         });
-//!
-//!     // Register the systems and get a handle
-//!     let handle = signal_chain.register(world);
-//!     // Store handle if cleanup is needed later
-//!     // handle.cleanup(world); // Example cleanup call
-//! }
-//!
-//! fn main() {
-//!     let mut app = App::new();
-//!     app.add_plugins(DefaultPlugins)
-//!         .add_plugins(JonmoPlugin) // Add the Jonmo plugin struct
-//!         .register_type::<Value>()
-//!         // ... setup entities and resources ...
-//!         .add_systems(Startup, setup_ui_declarative);
-//!     app.run();
-//! }
-//! ```
-
-use std::ops::Deref;
 
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, system::SystemState};
-use bevy_hierarchy::prelude::*;
 
 mod builder;
 mod signal;
@@ -91,7 +43,7 @@ use bevy_reflect::PartialReflect;
 // Publicly export items from modules
 pub use signal::*;
 pub use signal_vec::{
-    MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
+    MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff,
 };
 pub use tree::{pipe_signal, register_signal}; // Export SignalVec types
 
@@ -176,7 +128,7 @@ pub mod prelude {
         builder::*,
         signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
         signal_vec::{
-            MapVec, MutableVec, SignalVec, SignalVecBuilder, SignalVecExt, SourceVec, VecDiff,
+            MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff,
         },
     };
 }

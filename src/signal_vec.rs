@@ -282,32 +282,6 @@ where
     }
 }
 
-//-------------------------------------------------------------------------------------------------
-// SignalVecBuilder and SignalVecExt
-//-------------------------------------------------------------------------------------------------
-
-/// Provides static methods for creating new `SignalVec` chains.
-pub struct SignalVecBuilder;
-
-impl SignalVecBuilder {
-    // *** Removing from_system for now ***
-    // pub fn from_system<T, M, F>(system: F) -> SourceVec<T> ...
-    // todo!("SignalVecBuilder::from_system needs API revision to handle World access for registration");
-}
-
-/// A generic system that acts as a termination point in the signal graph
-/// for the map cleanup strategy. It takes a Vec<VecDiff<U>> and returns Option<T>.
-fn terminator_system<T, U>(
-    In(_diff_batch): In<Vec<VecDiff<U>>>, // Input is Vec<VecDiff<U>>
-) -> Option<T>
-// Output is Option<T>
-where
-    T: Reflect + FromReflect + GetTypeRegistration + Typed + SSs,
-    U: Reflect + FromReflect + GetTypeRegistration + Typed + SSs,
-{
-    None // Always returns None
-}
-
 /// Extension trait providing combinator methods for types implementing [`SignalVec`] and [`Clone`].
 pub trait SignalVecExt: SignalVec {
     // Use consolidated SignalVec trait
