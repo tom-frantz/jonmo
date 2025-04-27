@@ -130,7 +130,10 @@ pub(crate) fn process_signals(world: &mut World) {
     let mut orphaned_parent_signals =
         SystemState::<Query<Entity, (With<SystemRunner>, Without<Upstream>)>>::new(world);
     let orphaned_parent_signals = orphaned_parent_signals.get(world);
-    let orphaned_parent_signals = orphaned_parent_signals.iter().map(SignalSystem).collect::<Vec<_>>();
+    let orphaned_parent_signals = orphaned_parent_signals
+        .iter()
+        .map(SignalSystem)
+        .collect::<Vec<_>>();
     process_signals_helper(world, orphaned_parent_signals, Box::new(()));
 }
 
@@ -169,8 +172,7 @@ impl Plugin for JonmoPlugin {
 /// ```
 pub mod prelude {
     pub use crate::{
-        self as jonmo,
-        JonmoPlugin,
+        self as jonmo, JonmoPlugin,
         builder::*,
         signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
         signal_vec::{

@@ -13,7 +13,8 @@ use std::{
 use crate::{
     register_once_signal_from_system,
     signal::{RegisterOnceSignal, SignalHandle},
-    tree::{pipe_signal, register_signal, SignalSystem}, utils::SSs, // Removed mark_signal_root // Removed unused SignalNodeMetadata
+    tree::{SignalSystem, pipe_signal, register_signal},
+    utils::SSs, // Removed mark_signal_root // Removed unused SignalNodeMetadata
 };
 // Removed unused RunSystemOnce import
 // Removed unused crate::identity import
@@ -243,7 +244,7 @@ where
 
     fn register_signal_vec(mut self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register_signal_vec(world);
-        let signal = self.signal.get(world);
+        let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
         SignalHandle::new(signal)
     }
@@ -275,7 +276,7 @@ where
 
     fn register_signal_vec(mut self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register_signal_vec(world);
-        let signal = self.signal.get(world);
+        let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
         SignalHandle::new(signal)
     }
@@ -362,10 +363,7 @@ where
     where
         T::Item: Reflect + FromReflect + GetTypeRegistration + Typed + SSs,
         O: Reflect + FromReflect + GetTypeRegistration + Typed + SSs,
-        IS: IntoSystem<In<T::Item>, O, M> // F takes In<T>, returns Option<U>
-            + Send
-            + Sync
-            + 'static,
+        IS: IntoSystem<In<T::Item>, O, M> + Send + Sync + 'static,
         M: SSs,
     {
         let signal = RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
@@ -431,8 +429,7 @@ where
                     }
                 };
                 let signal = register_signal::<_, Vec<VecDiff<O>>, _, _, _>(world, wrapper_system);
-                // just attach the system to the lifetime of the signal, it won't be forwarded results because it doesn't have a `SystemRunner`
-                // TODO: don't use the parent/child hierarchy at all for signals ...
+                // just attach the system to the lifetime of the signal
                 world.entity_mut(*signal).add_child(system.entity());
                 signal.into()
             },
@@ -662,8 +659,7 @@ where
 #[derive(Component)]
 struct QueuedVecDiffs<T: FromReflect + GetTypeRegistration + Typed>(Vec<VecDiff<T>>);
 
-impl<T, A: Clone + FromReflect + GetTypeRegistration + Typed + SSs> From<T>
-    for MutableVec<A>
+impl<T, A: Clone + FromReflect + GetTypeRegistration + Typed + SSs> From<T> for MutableVec<A>
 where
     Vec<A>: From<T>,
 {

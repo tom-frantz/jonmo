@@ -3,9 +3,7 @@ use crate::{register_once_signal_from_system, utils::SSs};
 use bevy_derive::Deref;
 use bevy_ecs::{prelude::*, system::SystemId};
 use bevy_reflect::{FromReflect, PartialReflect, Reflect};
-use std::{
-    collections::HashSet, hash::Hash, sync::Arc
-};
+use std::{collections::HashSet, hash::Hash, sync::Arc};
 
 #[derive(Clone, Copy, Deref, Debug, PartialEq, Eq, Hash, Reflect)]
 pub struct SignalSystem(pub Entity);
@@ -55,13 +53,12 @@ where
     IS: IntoSystem<In<I>, IOO, M> + SSs,
     M: SSs,
 {
-    register_once_signal_from_system(system).get(world)
+    register_once_signal_from_system(system).register(world)
 }
 
 // TODO: 0.16 relationships
 #[derive(Component, Deref)]
 pub(crate) struct Upstream(HashSet<SignalSystem>);
-
 
 impl<'a> IntoIterator for &'a Upstream {
     type Item = <Self::IntoIter as Iterator>::Item;
@@ -76,7 +73,6 @@ impl<'a> IntoIterator for &'a Upstream {
 
 #[derive(Component, Deref)]
 pub(crate) struct Downstream(HashSet<SignalSystem>);
-
 
 impl<'a> IntoIterator for &'a Downstream {
     type Item = <Self::IntoIter as Iterator>::Item;
