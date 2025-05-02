@@ -226,15 +226,15 @@ impl EntityBuilder {
     }
 
     /// Register a reactive system that runs when the given [`Signal`] emits a value.
-    pub fn component_signal_from_component<C, OS, F, O>(self, f: F) -> Self
+    pub fn component_signal_from_component<I, O, S, F>(self, f: F) -> Self
     where
-        C: Component + Clone + FromReflect + GetTypeRegistration + Typed,
-        OS: Signal<Item = Option<O>> + SSs,
-        F: FnOnce(Map<Source<Entity>, C>) -> OS + SSs,
+        I: Component + Clone + FromReflect + GetTypeRegistration + Typed,
         O: Component + FromReflect + GetTypeRegistration + Typed + SSs,
+        S: Signal<Item = Option<O>> + SSs,
+        F: FnOnce(Map<Source<Entity>, I>) -> S + SSs,
     {
         self.component_signal_from_entity(|signal| {
-            f(signal.map(|In(entity): In<Entity>, components: Query<&C>| {
+            f(signal.map(|In(entity): In<Entity>, components: Query<&I>| {
                 components.get(entity).ok().cloned()
             }))
         })

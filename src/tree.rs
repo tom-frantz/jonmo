@@ -4,7 +4,7 @@ use bevy_derive::Deref;
 use bevy_ecs::{
     component::ComponentId,
     prelude::*,
-    system::{RunSystemOnce, SystemId},
+    system::{RunSystemOnce, SystemId, SystemState},
     world::DeferredWorld,
 };
 use bevy_reflect::{FromReflect, PartialReflect, Reflect};
@@ -161,4 +161,41 @@ impl SystemRunner {
     ) -> Option<Box<dyn PartialReflect>> {
         (self.runner)(world, input)
     }
+}
+
+fn clone_downstream(downstream: &Downstream) -> Vec<SignalSystem> {
+    downstream.iter().cloned().collect()
+}
+
+pub(crate) fn process_signals_helper(
+    world: &mut World,
+    signals: impl IntoIterator<Item = SignalSystem>,
+    input: Box<dyn PartialReflect>,
+) {
+    for signal in signals {
+        if let Some(runner) = world
+            .get_entity(*signal)
+            .ok()
+            .and_then(|entity| entity.get::<SystemRunner>().cloned())
+        {
+            if let Some(output) = runner.run(world, input.clone_value()) {
+                if let Some(downstream) = world.get::<Downstream>(*signal).map(clone_downstream) {
+                    process_signals_helper(world, downstream, output);
+                }
+            }
+        }
+    }
+}
+
+/// System that drives signal propagation by calling [`SignalPropagator::execute`].
+/// Added to the `Update` schedule by the [`JonmoPlugin`]. This system runs once per frame.
+/// It temporarily removes the [`SignalPropagator`] resource to allow mutable access to the `World`
+/// during system execution within the propagator.
+pub(crate) fn process_signals(world: &mut World) {
+    let mut orphan_parents = SystemState::<
+        Query<Entity, (With<SystemRunner>, Without<Upstream>, With<Downstream>)>,
+    >::new(world);
+    let orphan_parents = orphan_parents.get(world);
+    let orphan_parents = orphan_parents.iter().map(SignalSystem).collect::<Vec<_>>();
+    process_signals_helper(world, orphan_parents, Box::new(()));
 }
