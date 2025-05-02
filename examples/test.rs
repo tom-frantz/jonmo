@@ -42,18 +42,6 @@ fn ui_root() -> EntityBuilder {
     )
 }
 
-fn f(world: &mut World) {
-    let signal = SignalBuilder::from_system(|_: In<()>| 1);
-    signal.clone().register(world); // 1 ref
-    signal.clone().register(world); // 2 ref
-    let map = signal.map(|In(value): In<i32>, mut commands: Commands| {
-        commands.spawn(Text::new(value.to_string()));
-    }); // we don't want the root signal to be despawned when the others are, so we need to ref count it
-    map.clone().register(world); // 3 ref
-    map.clone().register(world); // 3 ref
-    // cleaning up either of these should not remove the root signal, but cleaning up both should
-}
-
 fn incr_value(mut ticker: ResMut<ValueTicker>, time: Res<Time>, mut values: Query<&mut Value>) {
     if ticker.tick(time.delta()).finished() {
         for mut value in values.iter_mut() {

@@ -1,7 +1,12 @@
 use crate::{register_once_signal_from_system, utils::SSs};
 
 use bevy_derive::Deref;
-use bevy_ecs::{prelude::*, system::SystemId};
+use bevy_ecs::{
+    component::ComponentId,
+    prelude::*,
+    system::{RunSystemOnce, SystemId},
+    world::DeferredWorld,
+};
 use bevy_reflect::{FromReflect, PartialReflect, Reflect};
 use std::{collections::HashSet, hash::Hash, sync::Arc};
 
@@ -23,9 +28,9 @@ impl SignalSystem {
 
 /// Component storing metadata for signal system nodes, primarily for reference counting.
 #[derive(Component)]
-pub(crate) struct SignalReferenceCount(i32);
+pub(crate) struct SignalRegistrationCount(i32);
 
-impl SignalReferenceCount {
+impl SignalRegistrationCount {
     /// Creates metadata with an initial reference count of 1.
     pub(crate) fn new() -> Self {
         Self(1)
@@ -45,20 +50,44 @@ impl SignalReferenceCount {
 ///
 /// Ensures the system is registered, attaches a runner component, and handles the
 /// reference counting via `SignalNodeMetadata`. Returns the `SystemId`.
-pub fn register_signal<I, O, IOO, IS, M>(world: &mut World, system: IS) -> SignalSystem
+pub fn register_signal<I, O, IOO, F, M>(world: &mut World, system: F) -> SignalSystem
 where
     I: FromReflect + SSs,
     O: FromReflect + SSs,
     IOO: Into<Option<O>> + SSs,
-    IS: IntoSystem<In<I>, IOO, M> + SSs,
+    F: IntoSystem<In<I>, IOO, M> + SSs,
     M: SSs,
 {
     register_once_signal_from_system(system).register(world)
 }
 
+fn downstream_syncer(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+    world.commands().queue(move |world: &mut World| {
+        let _ = world.run_system_once(
+            move |upstreams: Query<&Upstream>,
+                  mut downstreams: Query<&mut Downstream>,
+                  mut commands: Commands| {
+                if let Ok(upstream) = upstreams.get(entity) {
+                    for &upstream_system in upstream.iter() {
+                        if let Ok(mut downstreams) = downstreams.get_mut(*upstream_system) {
+                            downstreams.0.remove(&SignalSystem(entity));
+                            if downstreams.0.is_empty() {
+                                if let Some(mut entity) = commands.get_entity(*upstream_system) {
+                                    entity.remove::<Downstream>();
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        );
+    });
+}
+
 // TODO: 0.16 relationships
-#[derive(Component, Deref)]
-pub(crate) struct Upstream(HashSet<SignalSystem>);
+#[derive(Component, Deref, Clone)]
+#[component(on_remove = downstream_syncer)]
+pub(crate) struct Upstream(pub(crate) HashSet<SignalSystem>);
 
 impl<'a> IntoIterator for &'a Upstream {
     type Item = <Self::IntoIter as Iterator>::Item;

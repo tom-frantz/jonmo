@@ -1,9 +1,8 @@
-use crate::{tree::*, utils::SSs};
+use crate::{process_signals_helper, tree::*, utils::*};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     prelude::*,
-    query::{QueryData, QueryFilter, WorldQuery},
-    system::RunSystemOnce,
+    query::{QueryData, QueryFilter, WorldQuery}, system::RunSystemOnce,
 };
 use bevy_hierarchy::prelude::*;
 use bevy_log::prelude::*;
@@ -12,31 +11,50 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
+
+pub(crate) enum RegisterOnceSignalInternal {
+    // the function is just indirection required because IntoSystem isn't dyn compatible
+    System(Option<Box<dyn FnOnce(&mut World) -> SignalSystem + Send + Sync + 'static>>),
+    Registered(SignalSystem),
+}
 
 #[derive(Clone, Reflect)]
 #[reflect(opaque)]
-pub(crate) enum RegisterOnceSignal {
-    // the function is just indirection required because IntoSystem isn't dyn compatible
-    System(Arc<Mutex<Option<Box<dyn FnOnce(&mut World) -> SignalSystem + Send + Sync + 'static>>>>),
-    Registered(SignalSystem),
+pub(crate) struct RegisterOnceSignal {
+    inner: Arc<Mutex<RegisterOnceSignalInternal>>,
+}
+
+impl RegisterOnceSignal {
+    /// Creates a new `RegisterOnceSignal` that will register the system only once.
+    /// The system is provided as a closure that takes a mutable reference to the `World`.
+    pub fn new<F: FnOnce(&mut World) -> SignalSystem + Send + Sync + 'static>(system: F) -> Self {
+        RegisterOnceSignal {
+            inner: Arc::new(Mutex::new(RegisterOnceSignalInternal::System(Some(
+                Box::new(system),
+            )))),
+        }
+    }
 }
 
 impl RegisterOnceSignal {
     /// Registers the system if it hasn't been registered yet.
     /// Returns the system ID of the registered system.
     pub fn register(&mut self, world: &mut World) -> SignalSystem {
-        match self {
-            RegisterOnceSignal::System(f) => {
-                let signal = f.lock().unwrap().take().unwrap()(world).into();
-                *self = RegisterOnceSignal::Registered(signal);
+        let mut guard = self.inner.lock().unwrap();
+        match &mut *guard {
+            RegisterOnceSignalInternal::System(f) => {
+                let signal = f.take().unwrap()(world).into();
+                *guard = RegisterOnceSignalInternal::Registered(signal);
                 signal
             }
-            RegisterOnceSignal::Registered(signal) => {
+            RegisterOnceSignalInternal::Registered(signal) => {
                 if let Ok(mut system) = world.get_entity_mut(**signal) {
-                    if let Some(mut ref_count) = system.get_mut::<SignalReferenceCount>() {
-                        ref_count.increment();
+                    if let Some(mut registration_count) =
+                        system.get_mut::<SignalRegistrationCount>()
+                    {
+                        registration_count.increment();
                     }
                 }
                 *signal
@@ -66,9 +84,10 @@ pub trait Signal: SSs {
 
 /// Struct representing a source node in the signal chain definition. Implements [`Signal`].
 #[derive(Clone, Reflect)]
+#[reflect(opaque)]
 pub struct Source<O>
 where
-    O: SSs,
+    O: SSs + Clone,
 {
     signal: RegisterOnceSignal,
     _marker: PhantomData<O>,
@@ -76,7 +95,7 @@ where
 
 impl<O> Signal for Source<O>
 where
-    O: SSs,
+    O: SSs + Clone,
 {
     type Item = O;
 
@@ -386,7 +405,7 @@ where
 pub struct Switch<Upstream, Switcher>
 where
     Upstream: Signal,
-    Upstream::Item: Signal + FromReflect + SSs,
+    Upstream::Item: FromReflect + SSs,
     Switcher: Signal + FromReflect + SSs,
     Switcher::Item: FromReflect + SSs,
 {
@@ -396,11 +415,11 @@ where
 impl<Upstream, Switcher> Signal for Switch<Upstream, Switcher>
 where
     Upstream: Signal,
-    Upstream::Item: Signal + FromReflect + SSs,
+    Upstream::Item: FromReflect + SSs,
     Switcher: FromReflect + Signal,
     Switcher::Item: FromReflect + SSs,
 {
-    type Item = Upstream::Item;
+    type Item = Switcher::Item;
 
     fn register_signal(self, world: &mut World) -> SignalHandle {
         self.signal.register(world)
@@ -501,6 +520,25 @@ where
     }
 }
 
+fn signal_handle_cleanup_helper(
+    world: &mut World,
+    signals: impl IntoIterator<Item = SignalSystem>,
+) {
+    for signal in signals {
+        if let Some(upstreams) = world.get::<Upstream>(*signal).cloned() {
+            signal_handle_cleanup_helper(world, upstreams.0);
+        }
+        if let Ok(mut entity) = world.get_entity_mut(*signal) {
+            if let Some(mut registration_count) = entity.get_mut::<SignalRegistrationCount>() {
+                if registration_count.decrement() == 0 {
+                    entity.remove::<Upstream>();
+                    entity.remove::<Downstream>();
+                }
+            }
+        }
+    }
+}
+
 impl SignalHandle {
     /// Creates a new SignalHandle.
     /// This is crate-public to allow construction from other modules.
@@ -510,51 +548,22 @@ impl SignalHandle {
 
     /// decrements the ref count of this signal and all upstream signals, if the ref count reaches 0, despawns the signal and all its downstream
     pub fn cleanup(self, world: &mut World) {
-        let signal = self.0;
-        let _ = world.run_system_once(
-            move |upstreams: Query<&Upstream>,
-                  downstreams: Query<&Downstream>,
-                  mut ref_counts: Query<&mut SignalReferenceCount>,
-                  mut commands: Commands| {
-                for signal in [signal]
-                    .into_iter()
-                    .chain(UpstreamIter::new(&upstreams, signal))
-                {
-                    if let Ok(mut ref_count) = ref_counts.get_mut(*signal) {
-                        if ref_count.decrement() == 0 {
-                            if let Some(entity) = commands.get_entity(*signal) {
-                                entity.despawn_recursive();
-                            }
-                            let mut downstream_bug = false;
-                            for downstream in DownstreamIter::new(&downstreams, signal) {
-                                downstream_bug = true;
-                                if let Some(entity) = commands.get_entity(*downstream) {
-                                    entity.despawn_recursive();
-                                }
-                            }
-                            if downstream_bug {
-                                error!("downstreams should exist, this is a bug");
-                            }
-                        }
-                    }
-                }
-            },
-        );
+        signal_handle_cleanup_helper(world, [self.0]);
     }
 }
 
-pub(crate) fn spawn_signal<I, O, IOO, IS, M>(world: &mut World, system: IS) -> SignalSystem
+pub(crate) fn spawn_signal<I, O, IOO, F, M>(world: &mut World, system: F) -> SignalSystem
 where
     I: FromReflect + SSs,
     O: FromReflect + SSs,
     IOO: Into<Option<O>> + SSs,
-    IS: IntoSystem<In<I>, IOO, M> + SSs,
+    F: IntoSystem<In<I>, IOO, M> + SSs,
     M: SSs,
 {
     let system = world.register_system(system);
     let entity = system.entity();
     world.entity_mut(entity).insert((
-        SignalReferenceCount::new(),
+        SignalRegistrationCount::new(),
         SystemRunner {
             runner: Arc::new(Box::new(move |world, input| {
                 match I::from_reflect(input.as_ref()) {
@@ -587,17 +596,36 @@ where
     system.into()
 }
 
-pub(crate) fn register_once_signal_from_system<I, O, IOO, IS, M>(system: IS) -> RegisterOnceSignal
+// TODO: drop has to be impl for all signal structs, since they are the ones being cloned
+pub(crate) static CLEANUP_SIGNALS: LazyLock<Mutex<Vec<SignalSystem>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+impl Drop for RegisterOnceSignal {
+    fn drop(&mut self) {
+        if let RegisterOnceSignalInternal::Registered(signal) = &*self.inner.lock().unwrap() {
+            CLEANUP_SIGNALS.lock().unwrap().push(*signal);
+        }
+    }
+}
+
+pub(crate) fn flush_cleanup_signals(world: &mut World) {
+    let mut signals = CLEANUP_SIGNALS.lock().unwrap();
+    for signal in signals.drain(..) {
+        if let Ok(entity) = world.get_entity_mut(*signal) {
+            // entity.try_despawn_recursive();
+        }
+    }
+}
+
+pub(crate) fn register_once_signal_from_system<I, O, IOO, F, M>(system: F) -> RegisterOnceSignal
 where
     I: FromReflect + SSs,
     O: FromReflect + SSs,
     IOO: Into<Option<O>> + SSs,
-    IS: IntoSystem<In<I>, IOO, M> + SSs,
+    F: IntoSystem<In<I>, IOO, M> + SSs,
     M: SSs,
 {
-    RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
-        move |world: &mut World| spawn_signal(world, system),
-    )))))
+    RegisterOnceSignal::new(move |world: &mut World| spawn_signal(world, system))
 }
 
 /// Provides static methods for creating new signal chains (source signals).
@@ -613,11 +641,11 @@ impl From<Entity> for Source<Entity> {
 
 // Static methods to start signal chains, now associated with SignalBuilder struct
 impl SignalBuilder {
-    pub fn from_system<O, IOO, IS, M>(system: IS) -> Source<O>
+    pub fn from_system<O, IOO, F, M>(system: F) -> Source<O>
     where
-        O: FromReflect + SSs,
+        O: FromReflect + SSs + Clone,
         IOO: Into<Option<O>> + SSs,
-        IS: IntoSystem<In<()>, IOO, M> + SSs,
+        F: IntoSystem<In<()>, IOO, M> + SSs,
         M: SSs,
     {
         Source {
@@ -633,6 +661,10 @@ impl SignalBuilder {
     /// Internally uses [`SignalBuilder::from_system`] with [`entity_root`].
     pub fn from_entity(entity: Entity) -> Source<Entity> {
         Self::from_system(move |_: In<()>| entity)
+    }
+
+    pub fn from_lazy_entity(entity: LazyEntity) -> Source<Entity> {
+        Self::from_system(move |_: In<()>| entity.get())
     }
 
     /// Creates a signal chain that starts by observing changes to a specific component `C`
@@ -676,13 +708,13 @@ pub trait SignalExt: Signal {
     ///
     /// The system `F` must be `Clone` as it's captured for registration.
     /// Returns a [`Map`] signal node.
-    fn map<O, IOO, IS, M>(self, system: IS) -> Map<Self, O>
+    fn map<O, IOO, F, M>(self, system: F) -> Map<Self, O>
     where
         Self: Sized,
         Self::Item: FromReflect + SSs,
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
-        IS: IntoSystem<In<Self::Item>, IOO, M> + Send + Sync + 'static,
+        F: IntoSystem<In<Self::Item>, IOO, M> + Send + Sync + 'static,
         M: SSs;
 
     fn component<C>(self) -> MapComponent<Self, C>
@@ -697,7 +729,7 @@ pub trait SignalExt: Signal {
         Self: Signal<Item = Entity>,
         C: Component + Clone + FromReflect + GetTypeRegistration + Typed + SSs;
 
-    fn contains_component<C>(self) -> ContainsComponent<Self, C>
+    fn has_component<C>(self) -> ContainsComponent<Self, C>
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
@@ -739,9 +771,9 @@ pub trait SignalExt: Signal {
         Self::Item: PartialEq + FromReflect + SSs;
 
     fn neq(self, value: Self::Item) -> Neq<Self>
-        where
-            Self: Sized,
-            Self::Item: PartialEq + FromReflect + SSs;
+    where
+        Self: Sized,
+        Self::Item: PartialEq + FromReflect + SSs;
 
     fn not(self) -> Not<Self>
     where
@@ -749,18 +781,30 @@ pub trait SignalExt: Signal {
         <Self as Signal>::Item: std::ops::Not + FromReflect + SSs,
         <<Self as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs;
 
-    fn filter<M>(self, predicate: impl IntoSystem<In<Self::Item>, bool, M> + Send + Sync + 'static) -> Filter<Self>
+    fn filter<M>(
+        self,
+        predicate: impl IntoSystem<In<Self::Item>, bool, M> + Send + Sync + 'static,
+    ) -> Filter<Self>
     where
         Self: Sized,
         Self::Item: Clone + FromReflect + SSs;
 
-    fn switch<S, IS, M>(self, switcher: IS) -> Switch<Self, S>
+    fn filter_map<O, IOO, F, M>(self, system: F) -> FilterMap<Self, O>
     where
         Self: Sized,
-        Self::Item: Signal + FromReflect + SSs,
+        Self::Item: FromReflect + SSs,
+        O: FromReflect + SSs,
+        IOO: Into<Option<O>> + SSs,
+        F: IntoSystem<In<Self::Item>, IOO, M> + Send + Sync + 'static,
+        M: SSs;
+
+    fn switch<S, F, M>(self, switcher: F) -> Switch<Self, S>
+    where
+        Self: Sized,
+        Self::Item: FromReflect + SSs,
         S: Signal + Clone + FromReflect + SSs,
-        S::Item: FromReflect + SSs,
-        IS: IntoSystem<In<Self::Item>, S, M> + Send + Sync + 'static,
+        S::Item: FromReflect + SSs + Clone,
+        F: IntoSystem<In<Self::Item>, S, M> + Send + Sync + 'static,
         M: SSs;
 
     /// Adds a debug step to the signal chain that prints the value of the signal
@@ -787,13 +831,13 @@ impl<T> SignalExt for T
 where
     T: Signal,
 {
-    fn map<O, IOO, IS, M>(self, system: IS) -> Map<Self, O>
+    fn map<O, IOO, F, M>(self, system: F) -> Map<Self, O>
     where
         Self: Sized,
         Self::Item: FromReflect + SSs,
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
-        IS: IntoSystem<In<T::Item>, IOO, M> + SSs,
+        F: IntoSystem<In<T::Item>, IOO, M> + SSs,
         M: SSs,
     {
         Map {
@@ -829,16 +873,15 @@ where
         }
     }
 
-    fn contains_component<C>(self) -> ContainsComponent<Self, C>
+    fn has_component<C>(self) -> ContainsComponent<Self, C>
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
         C: Component + Clone + FromReflect + SSs,
     {
         ContainsComponent {
-            signal: self.map(|In(entity): In<Entity>, components: Query<&C>| {
-                components.contains(entity)
-            }),
+            signal: self
+                .map(|In(entity): In<Entity>, components: Query<&C>| components.contains(entity)),
             _marker: PhantomData,
         }
     }
@@ -941,11 +984,16 @@ where
                 if let Some((_, prev_forwarder)) = prev_system_option.take() {
                     prev_forwarder.cleanup(world);
                 }
-                let cur_clone = cur.clone();
-                let forwarder = signal.map(move |In(item)| {
-                    *cur_clone.lock().unwrap() = Some(item);
-                });
-                forwarder.register(world);
+                let forwarder = signal.map(clone!((cur) move |In(item)| {
+                    *cur.lock().unwrap() = Some(item);
+                }));
+                let handle = forwarder.register(world);
+                if let Ok(ancestor_orphans) = world.run_system_once(move |upstreams: Query<&Upstream>| {
+                    UpstreamIter::new(&upstreams, handle.0).filter(|upstream| !upstreams.contains(**upstream)).collect::<Vec<_>>()
+                }) {
+                    process_signals_helper(world, ancestor_orphans, Box::new(()));
+                }
+                *prev_system_option = Some((cur_system, handle.clone()));
             }
             cur.lock().unwrap().take()
         }) }
@@ -954,12 +1002,10 @@ where
     fn eq(self, value: Self::Item) -> Eq<Self>
     where
         Self: Sized,
-        Self::Item: PartialEq + FromReflect + SSs
+        Self::Item: PartialEq + FromReflect + SSs,
     {
         Eq {
-            signal: self.map(move |In(item): In<Self::Item>| {
-                item == value
-            })
+            signal: self.map(move |In(item): In<Self::Item>| item == value),
         }
     }
 
@@ -969,9 +1015,7 @@ where
         Self::Item: PartialEq + FromReflect + SSs,
     {
         Neq {
-            signal: self.map(move |In(item): In<Self::Item>| {
-                item != value
-            }),
+            signal: self.map(move |In(item): In<Self::Item>| item != value),
         }
     }
 
@@ -986,27 +1030,27 @@ where
         }
     }
 
-    fn filter<M>(self, predicate: impl IntoSystem<In<Self::Item>, bool, M> + Send + Sync + 'static) -> Filter<Self>
+    fn filter<M>(
+        self,
+        predicate: impl IntoSystem<In<Self::Item>, bool, M> + Send + Sync + 'static,
+    ) -> Filter<Self>
     where
         Self: Sized,
         Self::Item: Clone + FromReflect + SSs,
-
     {
-        let signal = RegisterOnceSignal::System(Arc::new(Mutex::new(Some(Box::new(
-            move |world: &mut World| {
-                let system = world.register_system(predicate);
-                let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
-                    match world.run_system_with_input(system, item.clone()) {
-                        Ok(true) => Some(item),
-                        Ok(false) | Err(_) => None, // terminate on false or error
-                    }
-                };
-                let signal = register_signal::<_, Self::Item, _, _, _>(world, wrapper_system);
-                // just attach the system to the lifetime of the signal
-                world.entity_mut(*signal).add_child(system.entity());
-                signal.into()
-            },
-        )))));
+        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+            let system = world.register_system(predicate);
+            let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
+                match world.run_system_with_input(system, item.clone()) {
+                    Ok(true) => Some(item),
+                    Ok(false) | Err(_) => None, // terminate on false or error
+                }
+            };
+            let signal = register_signal::<_, Self::Item, _, _, _>(world, wrapper_system);
+            // just attach the system to the lifetime of the signal
+            world.entity_mut(*signal).add_child(system.entity());
+            signal.into()
+        });
 
         Filter {
             upstream: self,
@@ -1015,13 +1059,29 @@ where
         }
     }
 
-    fn switch<S, IS, M>(self, switcher: IS) -> Switch<Self, S>
+    fn filter_map<O, IOO, F, M>(self, system: F) -> FilterMap<Self, O>
     where
         Self: Sized,
-        Self::Item: Signal + FromReflect + SSs,
+        Self::Item: FromReflect + SSs,
+        O: FromReflect + SSs,
+        IOO: Into<Option<O>> + SSs,
+        F: IntoSystem<In<Self::Item>, IOO, M> + Send + Sync + 'static,
+        M: SSs,
+    {
+        FilterMap {
+            upstream: self,
+            signal: register_once_signal_from_system(system),
+            _marker: PhantomData,
+        }
+    }
+
+    fn switch<S, F, M>(self, switcher: F) -> Switch<Self, S>
+    where
+        Self: Sized,
+        Self::Item: FromReflect + SSs,
         S: Signal + Clone + FromReflect + SSs,
-        S::Item: FromReflect + SSs,
-        IS: IntoSystem<In<Self::Item>, S, M> + Send + Sync + 'static,
+        S::Item: FromReflect + SSs + Clone,
+        F: IntoSystem<In<Self::Item>, S, M> + Send + Sync + 'static,
         M: SSs,
     {
         Switch {
@@ -1050,6 +1110,35 @@ where
     }
 }
 
+/// Struct representing a filter_map node in the signal chain definition. Implements [`Signal`].
+#[derive(Clone)]
+pub struct FilterMap<Upstream, O>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+    O: FromReflect + SSs,
+{
+    pub(crate) upstream: Upstream,
+    pub(crate) signal: RegisterOnceSignal,
+    _marker: PhantomData<O>,
+}
+
+impl<Upstream, O> Signal for FilterMap<Upstream, O>
+where
+    Upstream: Signal,
+    Upstream::Item: FromReflect + SSs,
+    O: FromReflect + SSs,
+{
+    type Item = O;
+
+    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+        let SignalHandle(upstream) = self.upstream.register(world);
+        let signal = self.signal.register(world);
+        pipe_signal(world, upstream, signal);
+        SignalHandle::new(signal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::JonmoPlugin;
@@ -1068,15 +1157,16 @@ mod tests {
 
     fn create_test_app() -> App {
         let mut app = App::new();
-        // Use Bevy's MinimalPlugins
         app.add_plugins((MinimalPlugins, JonmoPlugin));
-        // Register reflected types
         app.register_type::<TestData>();
         app
     }
 
     // Helper system to capture signal output
-    fn capture_output<T: SSs + Clone + Debug>(In(value): In<T>, mut output: ResMut<SignalOutput<T>>) {
+    fn capture_output<T: SSs + Clone + Debug>(
+        In(value): In<T>,
+        mut output: ResMut<SignalOutput<T>>,
+    ) {
         output.0 = Some(value);
     }
 
@@ -1088,384 +1178,361 @@ mod tests {
     fn test_map() {
         let mut app = create_test_app();
         app.init_resource::<SignalOutput<i32>>();
-
-        let source = SignalBuilder::from_system(|_: In<()>| 1);
-        let mapped = source.map(|In(x): In<i32>| x + 1);
-        let final_signal = mapped.map(capture_output::<i32>);
-
-        let handle = final_signal.register(app.world_mut());
+        let signal = SignalBuilder::from_system(|_: In<()>| 1)
+            .map(|In(x): In<i32>| x + 1)
+            .map(capture_output)
+            .register(app.world_mut());
         app.update();
-
-        assert_eq!(get_output::<i32>(app.world_mut()), Some(2));
-        handle.cleanup(app.world_mut());
+        assert_eq!(get_output::<i32>(app.world()), Some(2));
+        signal.cleanup(app.world_mut());
     }
 
     #[test]
     fn test_component() {
         let mut app = create_test_app();
         app.init_resource::<SignalOutput<TestData>>();
-
-        let entity = app.world_mut().spawn(TestData(42)).id();
-        let source = SignalBuilder::from_entity(entity);
-        let component_signal = source.component::<TestData>();
-        let final_signal = component_signal.map(capture_output::<TestData>);
-
-        let handle = final_signal.register(app.world_mut());
+        let entity = app.world_mut().spawn(TestData(1)).id();
+        let signal = SignalBuilder::from_entity(entity)
+            .component::<TestData>()
+            .map(capture_output)
+            .register(app.world_mut());
         app.update();
-
-        assert_eq!(get_output::<TestData>(app.world()), Some(TestData(42)));
-        handle.cleanup(app.world_mut());
+        assert_eq!(get_output::<TestData>(app.world()), Some(TestData(1)));
+        signal.cleanup(app.world_mut());
     }
 
     #[test]
     fn test_component_option() {
         let mut app = create_test_app();
-        app.init_resource::<SignalOutput<Option<TestData>>>();
-
-        let entity_with = app.world_mut().spawn(TestData(42)).id();
+        app.insert_resource(SignalOutput::<Option<TestData>>::default());
+        let entity_with = app.world_mut().spawn(TestData(1)).id();
         let entity_without = app.world_mut().spawn_empty().id();
 
-        // Test with component
-        let source_with = SignalBuilder::from_entity(entity_with);
-        let component_opt_with = source_with.component_option::<TestData>();
-        let final_signal_with = component_opt_with.map(capture_output::<Option<TestData>>);
-        let handle_with = final_signal_with.register(app.world_mut());
+        let signal = SignalBuilder::from_entity(entity_with)
+            .component_option::<TestData>()
+            .map(capture_output)
+            .register(app.world_mut());
         app.update();
-        assert_eq!(get_output::<Option<TestData>>(app.world()), Some(Some(TestData(42))));
-        handle_with.cleanup(app.world_mut());
+        assert_eq!(
+            get_output::<Option<TestData>>(app.world()),
+            Some(Some(TestData(1)))
+        );
+        signal.cleanup(app.world_mut());
 
-        // Reset output resource for the next part of the test
-        app.world_mut().resource_mut::<SignalOutput<Option<TestData>>>().0 = None;
-
-        // Test without component
-        let source_without = SignalBuilder::from_entity(entity_without);
-        let component_opt_without = source_without.component_option::<TestData>();
-        let final_signal_without = component_opt_without.map(capture_output::<Option<TestData>>);
-        let handle_without = final_signal_without.register(app.world_mut());
+        let signal = SignalBuilder::from_entity(entity_without)
+            .component_option::<TestData>()
+            .map(capture_output)
+            .register(app.world_mut());
         app.update();
         assert_eq!(get_output::<Option<TestData>>(app.world()), Some(None));
-        handle_without.cleanup(app.world_mut());
+        signal.cleanup(app.world_mut());
     }
 
     #[test]
-    fn test_contains_component() {
+    fn test_has_component() {
+        let mut app = create_test_app();
+        app.insert_resource(SignalOutput::<bool>::default());
+        let entity_with = app.world_mut().spawn(TestData(1)).id();
+        let entity_without = app.world_mut().spawn_empty().id();
+
+        let signal = SignalBuilder::from_entity(entity_with)
+            .has_component::<TestData>()
+            .map(capture_output)
+            .register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<bool>(app.world()), Some(true));
+        signal.cleanup(app.world_mut());
+
+        let signal = SignalBuilder::from_entity(entity_without)
+            .has_component::<TestData>()
+            .map(capture_output)
+            .register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<bool>(app.world()), Some(false));
+        signal.cleanup(app.world_mut());
+    }
+
+    #[test]
+    fn test_dedupe() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<i32>>();
+        let counter = Arc::new(Mutex::new(0));
+
+        let values = Arc::new(Mutex::new(vec![1, 1, 2, 3, 3, 3, 4]));
+        let signal = SignalBuilder::from_system(clone!((values) move |_: In<()>| {
+            let mut values_lock = values.lock().unwrap();
+            if values_lock.is_empty() {
+                None
+            } else {
+                Some(values_lock.remove(0))
+            }
+        }))
+        .dedupe()
+        .map(clone!((counter) move |In(val): In<i32>| {
+            *counter.lock().unwrap() += 1;
+            val
+        }))
+        .map(capture_output)
+        .register(app.world_mut());
+
+        for _ in 0..10 {
+            app.update();
+        }
+
+        assert_eq!(get_output::<i32>(app.world()), Some(4));
+        assert_eq!(*counter.lock().unwrap(), 4);
+        assert_eq!(values.lock().unwrap().len(), 0);
+
+        signal.cleanup(app.world_mut());
+    }
+
+    #[test]
+    fn test_first() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<i32>>();
+        let counter = Arc::new(Mutex::new(0));
+
+        let values = Arc::new(Mutex::new(vec![1, 2, 3]));
+        let signal = SignalBuilder::from_system(clone!((values) move |_: In<()>| {
+            let mut values_lock = values.lock().unwrap();
+            if values_lock.is_empty() {
+                None
+            } else {
+                Some(values_lock.remove(0))
+            }
+        }))
+        .first()
+        .map(clone!((counter) move |In(val): In<i32>| {
+            *counter.lock().unwrap() += 1;
+            val
+        }))
+        .map(capture_output)
+        .register(app.world_mut());
+
+        app.update();
+        app.update();
+        app.update();
+
+        assert_eq!(get_output::<i32>(app.world()), Some(1));
+        assert_eq!(*counter.lock().unwrap(), 1);
+        assert_eq!(values.lock().unwrap().len(), 0);
+
+        signal.cleanup(app.world_mut());
+    }
+
+    #[test]
+    fn test_combine() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<(i32, &'static str)>>();
+
+        let signal = SignalBuilder::from_system(move |_: In<()>| 10)
+            .combine(SignalBuilder::from_system(move |_: In<()>| "hello"))
+            .map(capture_output)
+            .register(app.world_mut());
+        app.update();
+
+        assert_eq!(
+            get_output::<(i32, &'static str)>(app.world()),
+            Some((10, "hello"))
+        );
+        signal.cleanup(app.world_mut());
+    }
+
+    #[test]
+    fn test_flatten() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<i32>>();
+
+        let signal_1 = SignalBuilder::from_system(|_: In<()>| 1);
+        let signal_2 = SignalBuilder::from_system(|_: In<()>| 2);
+
+        #[derive(Resource, Default)]
+        struct SignalSelector(bool);
+        app.init_resource::<SignalSelector>();
+
+        let signal = SignalBuilder::from_system(move |_: In<()>, selector: Res<SignalSelector>| {
+            if selector.0 {
+                signal_1.clone()
+            } else {
+                signal_2.clone()
+            }
+        })
+        .flatten()
+        .map(capture_output)
+        .register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<i32>(app.world()), Some(2));
+
+        app.world_mut().resource_mut::<SignalSelector>().0 = true;
+        app.update();
+        assert_eq!(get_output::<i32>(app.world()), Some(1));
+
+        signal.cleanup(app.world_mut());
+    }
+
+    #[test]
+    fn test_eq() {
         let mut app = create_test_app();
         app.init_resource::<SignalOutput<bool>>();
 
-        let entity_with = app.world_mut().spawn(TestData(42)).id();
-        let entity_without = app.world_mut().spawn_empty().id();
-
-        // Test with component
-        let source_with = SignalBuilder::from_entity(entity_with);
-        let contains_with = source_with.contains_component::<TestData>();
-        let final_signal_with = contains_with.map(capture_output::<bool>);
-        let handle_with = final_signal_with.register(app.world_mut());
+        let source = SignalBuilder::from_system(|_: In<()>| 1);
+        let signal = source
+            .clone()
+            .eq(1)
+            .map(capture_output)
+            .register(app.world_mut());
         app.update();
         assert_eq!(get_output::<bool>(app.world()), Some(true));
-        handle_with.cleanup(app.world_mut());
+        signal.cleanup(app.world_mut());
 
-        // Reset output resource
-        app.world_mut().resource_mut::<SignalOutput<bool>>().0 = None;
-
-        // Test without component
-        let source_without = SignalBuilder::from_entity(entity_without);
-        let contains_without = source_without.contains_component::<TestData>();
-        let final_signal_without = contains_without.map(capture_output::<bool>);
-        let handle_without = final_signal_without.register(app.world_mut());
+        let signal = source.eq(2).map(capture_output).register(app.world_mut());
         app.update();
         assert_eq!(get_output::<bool>(app.world()), Some(false));
-        handle_without.cleanup(app.world_mut());
+        signal.cleanup(app.world_mut());
     }
 
-    // #[test]
-    // fn test_dedupe() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<i32>>();
-    //     let output_res = app.world.resource::<SignalOutput<i32>>().clone();
-    //     let counter = Arc::new(Mutex::new(0));
+    #[test]
+    fn test_neq() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<bool>>();
 
-    //     let values = Arc::new(Mutex::new(vec![1, 1, 2, 3, 3, 3, 4]));
-    //     let source = SignalBuilder::from_system(move |_: In<()>| {
-    //         let mut values_lock = values.lock().unwrap();
-    //         if values_lock.is_empty() {
-    //             None
-    //         } else {
-    //             Some(values_lock.remove(0))
-    //         }
-    //     });
+        let source = SignalBuilder::from_system(|_: In<()>| 1);
+        let signal = source
+            .clone()
+            .neq(2)
+            .map(capture_output)
+            .register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<bool>(app.world()), Some(true));
+        signal.cleanup(app.world_mut());
 
-    //     let deduped = source.dedupe();
-    //     let final_signal = deduped.map(move |In(val): In<i32>| {
-    //         *counter.lock().unwrap() += 1;
-    //         capture_output(output_res.clone())(In(val));
-    //         Some(()) // Ensure map system returns Option
-    //     });
+        let signal = source.neq(1).map(capture_output).register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<bool>(app.world()), Some(false));
+        signal.cleanup(app.world_mut());
+    }
 
-    //     let handle = final_signal.register(&mut app.world);
+    #[test]
+    fn test_not() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<bool>>();
 
-    //     // Run multiple updates to process the vector
-    //     for _ in 0..10 {
-    //         app.update();
-    //     }
+        let signal = SignalBuilder::from_system(|_: In<()>| true)
+            .not()
+            .map(capture_output)
+            .register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<bool>(app.world()), Some(false));
+        signal.cleanup(app.world_mut());
 
-    //     assert_eq!(get_output::<i32>(&app.world), Some(4)); // Last unique value
-    //     assert_eq!(*counter.lock().unwrap(), 4); // Should have triggered 4 times (1, 2, 3, 4)
+        let signal = SignalBuilder::from_system(|_: In<()>| false)
+            .not()
+            .map(capture_output)
+            .register(app.world_mut());
+        app.update();
+        assert_eq!(get_output::<bool>(app.world()), Some(true));
+        signal.cleanup(app.world_mut());
+    }
 
-    //     handle.cleanup(&mut app.world);
-    // }
+    #[test]
+    fn test_filter() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<i32>>();
 
-    // #[test]
-    // fn test_first() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<i32>>();
-    //     let output_res = app.world.resource::<SignalOutput<i32>>().clone();
-    //     let counter = Arc::new(Mutex::new(0));
+        let values = Arc::new(Mutex::new(vec![1, 2, 3, 4, 5, 6]));
+        let signal = SignalBuilder::from_system(move |_: In<()>| {
+            let mut values_lock = values.lock().unwrap();
+            if values_lock.is_empty() {
+                None
+            } else {
+                Some(values_lock.remove(0))
+            }
+        })
+        .filter(|In(x): In<i32>| x % 2 == 0)
+        .map(capture_output)
+        .register(app.world_mut());
 
-    //     let values = Arc::new(Mutex::new(vec![1, 2, 3]));
-    //     let source = SignalBuilder::from_system(move |_: In<()>| {
-    //         let mut values_lock = values.lock().unwrap();
-    //         if values_lock.is_empty() {
-    //             None
-    //         } else {
-    //             Some(values_lock.remove(0))
-    //         }
-    //     });
+        for _ in 0..10 {
+            app.update();
+        }
 
-    //     let first_signal = source.first();
-    //     let final_signal = first_signal.map(move |In(val): In<i32>| {
-    //         *counter.lock().unwrap() += 1;
-    //         capture_output(output_res.clone())(In(val));
-    //         Some(()) // Ensure map system returns Option
-    //     });
+        assert_eq!(get_output::<i32>(app.world()), Some(6));
 
-    //     let handle = final_signal.register(&mut app.world);
+        signal.cleanup(app.world_mut());
+    }
 
-    //     app.update(); // Process 1
-    //     app.update(); // Process 2 (should be ignored by first)
-    //     app.update(); // Process 3 (should be ignored by first)
+    #[test]
+    fn test_filter_map() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<String>>();
 
-    //     assert_eq!(get_output::<i32>(&app.world), Some(1)); // Only the first value
-    //     assert_eq!(*counter.lock().unwrap(), 1); // Should have triggered only once
+        let values = Arc::new(Mutex::new(vec![1, 2, 3, 4, 5, 6]));
+        let signal = SignalBuilder::from_system(move |_: In<()>| {
+            let mut values_lock = values.lock().unwrap();
+            if values_lock.is_empty() {
+                None
+            } else {
+                Some(values_lock.remove(0))
+            }
+        })
+        .filter_map(|In(x): In<i32>| {
+            if x % 2 == 0 {
+                Some(format!("even: {}", x))
+            } else {
+                None
+            }
+        })
+        .map(capture_output::<String>) // Specify the type for capture_output
+        .register(app.world_mut());
 
-    //     handle.cleanup(&mut app.world);
-    // }
+        for _ in 0..10 {
+            app.update();
+        }
 
-    // #[test]
-    // fn test_combine() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<(i32, String)>>();
-    //     let output_res = app.world.resource::<SignalOutput<(i32, String)>>().clone();
+        assert_eq!(get_output::<String>(app.world()), Some("even: 6".to_string()));
 
-    //     let source1_val = Arc::new(Mutex::new(Some(10)));
-    //     let source1 = SignalBuilder::from_system(move |_: In<()>| source1_val.lock().unwrap().take());
+        signal.cleanup(app.world_mut());
+    }
 
-    //     let source2_val = Arc::new(Mutex::new(Some("hello".to_string())));
-    //     let source2 = SignalBuilder::from_system(move |_: In<()>| source2_val.lock().unwrap().take());
+    #[test]
+    fn test_switch() {
+        let mut app = create_test_app();
+        app.init_resource::<SignalOutput<i32>>();
 
-    //     let combined = source1.combine(source2);
-    //     let final_signal = combined.map(capture_output(output_res));
+        let signal_1 = SignalBuilder::from_system(|_: In<()>| 1);
+        let signal_2 = SignalBuilder::from_system(|_: In<()>| 2);
 
-    //     let handle = final_signal.register(&mut app.world);
-    //     app.update();
+        #[derive(Resource, Default)]
+        struct SwitcherToggle(bool);
+        app.init_resource::<SwitcherToggle>();
 
-    //     assert_eq!(get_output::<(i32, String)>(&app.world), Some((10, "hello".to_string())));
-    //     handle.cleanup(&mut app.world);
-    // }
+        let signal =
+            SignalBuilder::from_system(move |_: In<()>, mut toggle: ResMut<SwitcherToggle>| {
+                let current = toggle.0;
+                toggle.0 = !toggle.0;
+                current
+            })
+            .switch(move |In(use_1): In<bool>| {
+                if use_1 {
+                    signal_1.clone()
+                } else {
+                    signal_2.clone()
+                }
+            })
+            .map(capture_output)
+            .register(app.world_mut());
 
-    // // Flatten test needs adjustment for how signals are created and returned.
-    // // Let's use a resource to hold the inner signal definition.
-    // #[derive(Resource, Clone)]
-    // struct InnerSignalDef(Source<i32>);
+        app.update();
+        assert_eq!(get_output::<i32>(app.world()), Some(2));
 
-    // #[test]
-    // fn test_flatten() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<i32>>();
-    //     let output_res = app.world.resource::<SignalOutput<i32>>().clone();
+        app.update();
+        assert_eq!(get_output::<i32>(app.world()), Some(1));
 
-    //     // Define two potential inner signals
-    //     let inner_signal_100 = SignalBuilder::from_system(|_: In<()>| Some(100));
-    //     let inner_signal_200 = SignalBuilder::from_system(|_: In<()>| Some(200));
+        app.update();
+        assert_eq!(get_output::<i32>(app.world()), Some(2));
 
-    //     // Resource to control which inner signal is active
-    //     #[derive(Resource, Default)] struct InnerSelector(bool);
-    //     app.insert_resource::<InnerSignalDef>(inner_signal_100.clone()); // Start with 100
-
-    //     // Outer signal emits the *definition* of the inner signal based on the selector
-    //     let outer_signal = SignalBuilder::from_system(move |_: In<()>, selector: Res<InnerSelector>| {
-    //          if selector.0 {
-    //              Some(inner_signal_100.clone()) // Clone the definition
-    //          } else {
-    //              Some(inner_signal_200.clone())
-    //          }
-    //     });
-
-    //     let flattened = outer_signal.flatten();
-    //     let final_signal = flattened.map(capture_output(output_res));
-
-    //     let handle = final_signal.register(&mut app.world);
-
-    //     app.update(); // Outer runs (selector=false), emits inner_200 def, flatten registers inner_200, inner_200 runs
-    //     assert_eq!(get_output::<i32>(&app.world), Some(200));
-
-    //     // Change the selector and update again
-    //     app.world.resource_mut::<InnerSelector>().0 = true;
-    //     app.update(); // Outer runs (selector=true), emits inner_100 def, flatten cleans up old, registers inner_100, inner_100 runs
-    //     assert_eq!(get_output::<i32>(&app.world), Some(100));
-
-    //     handle.cleanup(&mut app.world);
-    // }
-
-    // #[test]
-    // fn test_eq() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<bool>>();
-    //     let output_res = app.world.resource::<SignalOutput<bool>>().clone();
-
-    //     let source = SignalBuilder::from_system(|_: In<()>| Some(5));
-    //     let eq_signal = source.eq(5);
-    //     let final_signal = eq_signal.map(capture_output(output_res.clone()));
-    //     let handle = final_signal.register(&mut app.world);
-    //     app.update();
-    //     assert_eq!(get_output::<bool>(&app.world), Some(true));
-    //     handle.cleanup(&mut app.world);
-
-    //     *output_res.0.lock().unwrap() = None; // Reset
-    //     let source_neq = SignalBuilder::from_system(|_: In<()>| Some(6));
-    //     let eq_signal_neq = source_neq.eq(5);
-    //     let final_signal_neq = eq_signal_neq.map(capture_output(output_res));
-    //     let handle_neq = final_signal_neq.register(&mut app.world);
-    //     app.update();
-    //     assert_eq!(get_output::<bool>(&app.world), Some(false));
-    //     handle_neq.cleanup(&mut app.world);
-    // }
-
-    // #[test]
-    // fn test_neq() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<bool>>();
-    //     let output_res = app.world.resource::<SignalOutput<bool>>().clone();
-
-    //     let source = SignalBuilder::from_system(|_: In<()>| Some(5));
-    //     let neq_signal = source.neq(6);
-    //     let final_signal = neq_signal.map(capture_output(output_res.clone()));
-    //     let handle = final_signal.register(&mut app.world);
-    //     app.update();
-    //     assert_eq!(get_output::<bool>(&app.world), Some(true));
-    //     handle.cleanup(&mut app.world);
-
-    //     *output_res.0.lock().unwrap() = None; // Reset
-    //     let source_eq = SignalBuilder::from_system(|_: In<()>| Some(5));
-    //     let neq_signal_eq = source_eq.neq(5);
-    //     let final_signal_eq = neq_signal_eq.map(capture_output(output_res));
-    //     let handle_eq = final_signal_eq.register(&mut app.world);
-    //     app.update();
-    //     assert_eq!(get_output::<bool>(&app.world), Some(false));
-    //     handle_eq.cleanup(&mut app.world);
-    // }
-
-    // #[test]
-    // fn test_not() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<bool>>();
-    //     let output_res = app.world.resource::<SignalOutput<bool>>().clone();
-
-    //     let source_true = SignalBuilder::from_system(|_: In<()>| Some(true));
-    //     let not_true = source_true.not();
-    //     let final_signal_true = not_true.map(capture_output(output_res.clone()));
-    //     let handle_true = final_signal_true.register(&mut app.world);
-    //     app.update();
-    //     assert_eq!(get_output::<bool>(&app.world), Some(false));
-    //     handle_true.cleanup(&mut app.world);
-
-    //     *output_res.0.lock().unwrap() = None; // Reset
-    //     let source_false = SignalBuilder::from_system(|_: In<()>| Some(false));
-    //     let not_false = source_false.not();
-    //     let final_signal_false = not_false.map(capture_output(output_res));
-    //     let handle_false = final_signal_false.register(&mut app.world);
-    //     app.update();
-    //     assert_eq!(get_output::<bool>(&app.world), Some(true));
-    //     handle_false.cleanup(&mut app.world);
-    // }
-
-    // #[test]
-    // fn test_filter() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<i32>>();
-    //     let output_res = app.world.resource::<SignalOutput<i32>>().clone();
-    //     let counter = Arc::new(Mutex::new(0));
-
-    //     let values = Arc::new(Mutex::new(vec![1, 2, 3, 4, 5, 6]));
-    //     let source = SignalBuilder::from_system(move |_: In<()>| {
-    //         let mut values_lock = values.lock().unwrap();
-    //         if values_lock.is_empty() {
-    //             None
-    //         } else {
-    //             Some(values_lock.remove(0))
-    //         }
-    //     });
-
-    //     let filtered = source.filter(|In(x): In<i32>| x % 2 == 0); // Keep even numbers
-    //     let final_signal = filtered.map(move |In(val): In<i32>| {
-    //         *counter.lock().unwrap() += 1;
-    //         capture_output(output_res.clone())(In(val));
-    //         Some(()) // Ensure map system returns Option
-    //     });
-
-    //     let handle = final_signal.register(&mut app.world);
-
-    //     for _ in 0..10 {
-    //         app.update();
-    //     }
-
-    //     assert_eq!(get_output::<i32>(&app.world), Some(6)); // Last even number
-    //     assert_eq!(*counter.lock().unwrap(), 3); // Should have triggered 3 times (2, 4, 6)
-
-    //     handle.cleanup(&mut app.world);
-    // }
-
-    // #[test]
-    // fn test_switch() {
-    //     let mut app = create_test_app();
-    //     app.init_resource::<SignalOutput<i32>>();
-    //     let output_res = app.world.resource::<SignalOutput<i32>>().clone();
-
-    //     // Define the two potential inner signals
-    //     let signal_a = SignalBuilder::from_system(|_: In<()>| Some(10));
-    //     let signal_b = SignalBuilder::from_system(|_: In<()>| Some(20));
-
-    //     #[derive(Resource, Default)] struct SwitcherToggle(bool);
-    //     app.init_resource::<SwitcherToggle>();
-
-    //     let switcher_signal = SignalBuilder::from_system(move |_: In<()>, mut toggle: ResMut<SwitcherToggle>| {
-    //         let current = toggle.0;
-    //         toggle.0 = !toggle.0;
-    //         Some(current) // Emit false, then true, then false...
-    //     });
-
-    //     // The switcher function maps the boolean from switcher_signal to one of the inner signals
-    //     let switched = switcher_signal.switch(move |In(use_a): In<bool>| {
-    //         if use_a {
-    //             signal_a.clone() // Clone the definition
-    //         } else {
-    //             signal_b.clone()
-    //         }
-    //     });
-
-    //     let final_signal = switched.map(capture_output(output_res));
-    //     let handle = final_signal.register(&mut app.world);
-
-    //     app.update(); // Switcher=false, inner=signal_b (20)
-    //     assert_eq!(get_output::<i32>(&app.world), Some(20));
-
-    //     app.update(); // Switcher=true, inner=signal_a (10)
-    //     assert_eq!(get_output::<i32>(&app.world), Some(10));
-
-    //     app.update(); // Switcher=false, inner=signal_b (20)
-    //     assert_eq!(get_output::<i32>(&app.world), Some(20));
-
-    //     handle.cleanup(&mut app.world);
-    // }
+        signal.cleanup(app.world_mut());
+    }
 
     // #[test]
     // fn test_debug() {
@@ -1479,11 +1546,11 @@ mod tests {
     //     let debugged = source.debug();
     //     let final_signal = debugged.map(capture_output(output_res));
 
-    //     let handle = final_signal.register(&mut app.world);
+    //     let handle = final_signal.register(app.world_mut());
     //     app.update();
 
-    //     assert_eq!(get_output::<i32>(&app.world), Some(99));
-    //     handle.cleanup(&mut app.world);
+    //     assert_eq!(get_output::<i32>(app.world()), Some(99));
+    //     handle.cleanup(app.world_mut());
     // }
 
     // #[test]
@@ -1494,11 +1561,11 @@ mod tests {
     //     let mapped = source.map(|In(x): In<i32>| x + 1);
 
     //     // Register
-    //     let handle = mapped.clone().register(&mut app.world);
+    //     let handle = mapped.clone().register(app.world_mut());
     //     // Need a way to reliably get the entities. Let's assume the source system is created first.
     //     // This is fragile. A better way might involve querying by a marker component.
     //     let mut query = app.world.query::<(Entity, &SignalReferenceCount)>();
-    //     let entities: Vec<Entity> = query.iter(&app.world).map(|(e, _)| e).collect();
+    //     let entities: Vec<Entity> = query.iter(app.world()).map(|(e, _)| e).collect();
     //     assert!(entities.len() >= 2, "Expected at least source and map systems");
     //     // Assuming source is the first one registered by the builder, and map is the one in the handle
     //     let source_entity = entities[0]; // Highly dependent on registration order
@@ -1510,7 +1577,7 @@ mod tests {
     //     assert_eq!(app.world.get::<SignalReferenceCount>(map_entity).unwrap().count(), 1);
 
     //     // Register again (should increment ref count)
-    //     let handle2 = mapped.clone().register(&mut app.world);
+    //     let handle2 = mapped.clone().register(app.world_mut());
     //     assert_eq!(app.world.get::<SignalReferenceCount>(source_entity).unwrap().count(), 2);
     //     // The map entity might be different if register_once_signal_from_system re-registers.
     //     // Let's check the handle's entity specifically.
@@ -1518,15 +1585,14 @@ mod tests {
     //     assert_eq!(map_entity, map_entity2, "Expected same map entity on re-register");
     //     assert_eq!(app.world.get::<SignalReferenceCount>(map_entity).unwrap().count(), 2);
 
-
     //     // Cleanup first handle
-    //     handle.cleanup(&mut app.world);
+    //     handle.cleanup(app.world_mut());
     //     app.update(); // Allow cleanup system to run
     //     assert_eq!(app.world.get::<SignalReferenceCount>(source_entity).unwrap().count(), 1);
     //     assert_eq!(app.world.get::<SignalReferenceCount>(map_entity).unwrap().count(), 1);
 
     //     // Cleanup second handle (should despawn)
-    //     handle2.cleanup(&mut app.world);
+    //     handle2.cleanup(app.world_mut());
     //     app.update(); // Allow cleanup system to run
 
     //     // Entities should be despawned
@@ -1534,5 +1600,3 @@ mod tests {
     //     assert!(app.world.get_entity(map_entity).is_none());
     // }
 }
-
-

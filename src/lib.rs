@@ -42,9 +42,7 @@ pub use builder::EntityBuilder;
 use bevy_reflect::PartialReflect;
 // Publicly export items from modules
 pub use signal::*;
-pub use signal_vec::{
-    MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff,
-};
+pub use signal_vec::{MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff};
 pub use tree::{pipe_signal, register_signal}; // Export SignalVec types
 
 use tree::{Downstream, SignalSystem, SystemRunner, Upstream};
@@ -79,8 +77,9 @@ fn process_signals_helper(
 /// It temporarily removes the [`SignalPropagator`] resource to allow mutable access to the `World`
 /// during system execution within the propagator.
 pub(crate) fn process_signals(world: &mut World) {
-    let mut orphaned_parent_signals =
-        SystemState::<Query<Entity, (With<SystemRunner>, Without<Upstream>)>>::new(world);
+    let mut orphaned_parent_signals = SystemState::<
+        Query<Entity, (With<SystemRunner>, Without<Upstream>, With<Downstream>)>,
+    >::new(world);
     let orphaned_parent_signals = orphaned_parent_signals.get(world);
     let orphaned_parent_signals = orphaned_parent_signals
         .iter()
@@ -109,7 +108,7 @@ pub struct JonmoPlugin;
 
 impl Plugin for JonmoPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Last, process_signals);
+        app.add_systems(Last, (process_signals, flush_cleanup_signals).chain());
     }
 }
 
@@ -127,9 +126,7 @@ pub mod prelude {
         self as jonmo, JonmoPlugin,
         builder::*,
         signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
-        signal_vec::{
-            MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff,
-        },
+        signal_vec::{MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff},
     };
 }
 

@@ -1,8 +1,7 @@
 use bevy_ecs::prelude::*;
-use std::{
-    ops::Deref,
-    sync::{Arc, OnceLock},
-};
+#[doc(no_inline)]
+pub use enclose::enclose as clone;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Default, Clone)]
 pub struct LazyEntity(Arc<OnceLock<Entity>>);

@@ -107,11 +107,11 @@ impl EntityBuilder {
     /// The system receives the value emitted by the signal.
     /// Note: The system is registered *directly* on the builder and will be transferred
     /// to the entity's `SignalHandlers` component upon spawning.
-    pub fn on_signal<I, S, IS, M>(self, signal: S, system: IS) -> Self
+    pub fn on_signal<I, S, F, M>(self, signal: S, system: F) -> Self
     where
         I: FromReflect + GetTypeRegistration + Typed + SSs,
         S: Signal<Item = I> + SSs,
-        IS: IntoSystem<In<(Entity, I)>, (), M> + SSs,
+        F: IntoSystem<In<(Entity, I)>, (), M> + SSs,
         M: SSs,
     {
         let on_spawn = move |world: &mut World, entity: Entity| {
