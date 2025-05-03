@@ -37,7 +37,7 @@ mod signal;
 mod signal_vec;
 mod tree;
 pub mod utils;
-pub use builder::EntityBuilder;
+pub use builder::JonmoBuilder;
 
 use bevy_reflect::PartialReflect;
 // Publicly export items from modules
@@ -45,7 +45,7 @@ pub use signal::*;
 pub use signal_vec::{MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff};
 pub use tree::{pipe_signal, register_signal}; // Export SignalVec types
 
-use tree::{Downstream, SignalSystem, SystemRunner, Upstream, process_signals};
+use tree::{Downstream, SignalSystem, SystemRunner, Upstream, process_signals, flush_cleanup_signals};
 use utils::SSs;
 
 /// The Bevy plugin required for `jonmo` signals to function.
@@ -85,7 +85,8 @@ pub mod prelude {
     pub use crate::{
         self as jonmo, JonmoPlugin,
         builder::*,
-        signal::{Combine, Map, Signal, SignalBuilder, SignalExt, SignalHandle, Source},
+        signal::{Combine, Map, Signal, SignalBuilder, SignalExt, Source},
+        tree::SignalHandle,
         signal_vec::{MapVec, MutableVec, SignalVec, SignalVecExt, SourceVec, VecDiff},
     };
 }

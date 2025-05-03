@@ -25,8 +25,8 @@ struct ValueTicker(Timer);
 #[derive(Component, Reflect, Clone, Default, PartialEq)]
 struct Value(i32);
 
-fn ui_root() -> EntityBuilder {
-    EntityBuilder::from(Node {
+fn ui_root() -> JonmoBuilder {
+    JonmoBuilder::from(Node {
         justify_content: JustifyContent::Center,
         align_items: AlignItems::Center,
         height: Val::Percent(100.),
@@ -34,7 +34,7 @@ fn ui_root() -> EntityBuilder {
         ..default()
     })
     .child(
-        EntityBuilder::from(Node::default())
+        JonmoBuilder::from(Node::default())
             .insert(Value(0))
             .component_signal_from_component(|signal| {
                 signal.map(|In(value): In<Value>| Some(Text(value.0.to_string())))

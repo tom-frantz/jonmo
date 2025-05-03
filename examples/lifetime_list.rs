@@ -32,8 +32,8 @@ struct Colors(MutableVec<Color>);
 #[derive(Component, Default, Clone, Reflect)]
 struct Lifetime(f32);
 
-fn ui_root(colors: impl SignalVec<Item = Color>) -> EntityBuilder {
-    EntityBuilder::from(Node {
+fn ui_root(colors: impl SignalVec<Item = Color>) -> JonmoBuilder {
+    JonmoBuilder::from(Node {
         height: Val::Percent(100.0),
         width: Val::Percent(100.0),
         flex_direction: FlexDirection::Column,
@@ -45,8 +45,8 @@ fn ui_root(colors: impl SignalVec<Item = Color>) -> EntityBuilder {
     .children_signal_vec(colors.map(|In(color)| item(color)))
 }
 
-fn item(color: Color) -> EntityBuilder {
-    EntityBuilder::from((
+fn item(color: Color) -> JonmoBuilder {
+    JonmoBuilder::from((
         Node {
             height: Val::Px(40.0),
             width: Val::Px(200.0),
@@ -57,7 +57,7 @@ fn item(color: Color) -> EntityBuilder {
         BackgroundColor(color),
     ))
     .child(
-        EntityBuilder::from((
+        JonmoBuilder::from((
             Node {
                 height: Val::Percent(100.),
                 width: Val::Percent(100.),

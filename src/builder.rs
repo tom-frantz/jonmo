@@ -2,7 +2,8 @@
 
 use crate::{
     prelude::*,
-    signal::{Signal, SignalExt, SignalHandle},
+    signal::{Signal, SignalExt},
+    tree::SignalHandle,
     utils::{LazyEntity, SSs},
 };
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
@@ -59,19 +60,19 @@ fn add_handle(world: &mut World, entity: Entity, handle: SignalHandle) {
 /// children using a declarative builder pattern. Inspired by Dominator's DomBuilder and Haalka's NodeBuilder.
 #[derive(Default, Clone, Reflect)] // Removed Clone
 #[reflect(opaque)]
-pub struct EntityBuilder {
+pub struct JonmoBuilder {
     #[allow(clippy::type_complexity)]
     on_spawns: Arc<Mutex<Vec<Box<dyn FnOnce(&mut World, Entity) + Send + Sync>>>>, // Changed type
     child_block_populations: Arc<Mutex<Vec<usize>>>, // Keep this for child logic for now
 }
 
-impl<T: Bundle> From<T> for EntityBuilder {
+impl<T: Bundle> From<T> for JonmoBuilder {
     fn from(bundle: T) -> Self {
         Self::new().insert(bundle)
     }
 }
 
-impl EntityBuilder {
+impl JonmoBuilder {
     /// Create a new, empty [`NodeBuilder`].
     pub fn new() -> Self {
         Self::default()
@@ -242,7 +243,7 @@ impl EntityBuilder {
 
     /// Declare a static child node.
     /// The child is spawned and added to the parent when the parent is spawned.
-    pub fn child(self, child: EntityBuilder) -> Self {
+    pub fn child(self, child: JonmoBuilder) -> Self {
         let block = self.child_block_populations.lock().unwrap().len();
         self.child_block_populations.lock().unwrap().push(1);
         let offset = offset(block, &self.child_block_populations.lock().unwrap());
@@ -261,7 +262,7 @@ impl EntityBuilder {
     }
 
     /// Declare a reactive child. When the [`Signal`] outputs [`None`], the child is removed.
-    pub fn child_signal<T: Into<Option<EntityBuilder>> + FromReflect>(
+    pub fn child_signal<T: Into<Option<JonmoBuilder>> + FromReflect>(
         self,
         child_option: impl Signal<Item = T> + SSs,
     ) -> Self {
@@ -310,10 +311,10 @@ impl EntityBuilder {
     /// Declare static children.
     pub fn children(
         self,
-        children: impl IntoIterator<Item = EntityBuilder> + Send + 'static,
+        children: impl IntoIterator<Item = JonmoBuilder> + Send + 'static,
     ) -> Self {
         let block = self.child_block_populations.lock().unwrap().len();
-        let children_vec: Vec<EntityBuilder> = children.into_iter().collect(); // Collect into Vec
+        let children_vec: Vec<JonmoBuilder> = children.into_iter().collect(); // Collect into Vec
         let population = children_vec.len();
         self.child_block_populations
             .lock()
@@ -352,13 +353,13 @@ impl EntityBuilder {
     /// Declare reactive children based on a `SignalVec`.
     pub fn children_signal_vec(
         self,
-        children_signal_vec: impl SignalVec<Item = EntityBuilder>,
+        children_signal_vec: impl SignalVec<Item = JonmoBuilder>,
     ) -> Self {
         let block = self.child_block_populations.lock().unwrap().len();
         self.child_block_populations.lock().unwrap().push(0);
         let child_block_populations = self.child_block_populations.clone();
         let on_spawn = move |world: &mut World, parent: Entity| {
-            let system = move |In(diffs): In<Vec<VecDiff<EntityBuilder>>>,
+            let system = move |In(diffs): In<Vec<VecDiff<JonmoBuilder>>>,
                                world: &mut World,
                                mut children_entities: Local<Vec<Entity>>| {
                 for diff in diffs {

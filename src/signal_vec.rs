@@ -10,10 +10,8 @@ use std::{
 };
 
 use crate::{
-    register_once_signal_from_system,
-    signal::{RegisterOnceSignal, SignalHandle},
-    tree::{SignalSystem, pipe_signal, register_signal},
-    utils::SSs, // Removed mark_signal_root // Removed unused SignalNodeMetadata
+    tree::{SignalSystem, pipe_signal, register_signal, SignalHandle, RegisterOnceSignal, register_once_signal_from_system},
+    utils::SSs,
 };
 // Removed unused RunSystemOnce import
 // Removed unused crate::identity import
