@@ -1,21 +1,15 @@
 use crate::{tree::*, utils::*};
-use bevy_derive::{Deref, DerefMut};
-use bevy_ecs::{
-    prelude::*,
-    query::{QueryData, QueryFilter, WorldQuery},
-};
+use bevy_ecs::prelude::*;
 use bevy_hierarchy::prelude::*;
 use bevy_log::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, PartialReflect, Reflect, Typed};
 use bevy_time::{Time, Timer, TimerMode}; // Use Timer and TimerMode for throttle
 use std::{
-    collections::VecDeque,
     fmt::Debug,
     marker::PhantomData,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::Duration, // Add Duration import
 }; // Add import
-
 
 /// Represents a value that changes over time and handles internal registration logic.
 ///
@@ -44,7 +38,7 @@ pub trait Signal: SSs {
 /// from a Bevy resource, component, entity, or a custom system.
 #[derive(Clone, Reflect)]
 pub struct Source<O> {
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     #[reflect(ignore)]
     _marker: PhantomData<O>,
 }
@@ -55,7 +49,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         SignalHandle::new(self.signal.register(world))
     }
 }
@@ -69,7 +63,7 @@ where
 #[derive(Clone, Reflect)]
 pub struct Map<Upstream, O> {
     pub(crate) upstream: Upstream,
-    pub(crate) signal: RegisterOnceSignal,
+    pub(crate) signal: LazySignal,
     #[reflect(ignore)]
     _marker: PhantomData<O>,
 }
@@ -223,7 +217,7 @@ where
 {
     pub(crate) left_wrapper: Map<Left, (Option<Left::Item>, Option<Right::Item>)>,
     pub(crate) right_wrapper: Map<Right, (Option<Left::Item>, Option<Right::Item>)>,
-    pub(crate) signal: RegisterOnceSignal,
+    pub(crate) signal: LazySignal,
 }
 
 impl<Left, Right> Signal for Combine<Left, Right>
@@ -235,7 +229,7 @@ where
 {
     type Item = (Left::Item, Right::Item);
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(left_upstream) = self.left_wrapper.register(world);
         let SignalHandle(right_upstream) = self.right_wrapper.register(world);
         let signal = self.signal.register(world);
@@ -256,9 +250,8 @@ pub struct Flatten<Upstream>
 where
     Upstream: Signal,
     Upstream::Item: FromReflect + Signal,
-    <Upstream::Item as Signal>::Item: FromReflect + SSs,
+    <Upstream::Item as Signal>::Item: FromReflect + SSs + Clone,
 {
-    #[reflect(ignore)]
     pub(crate) signal: Map<Upstream, <Upstream::Item as Signal>::Item>,
 }
 
@@ -266,7 +259,7 @@ impl<Upstream> Signal for Flatten<Upstream>
 where
     Upstream: Signal,
     Upstream::Item: FromReflect + Signal,
-    <Upstream::Item as Signal>::Item: FromReflect + SSs,
+    <Upstream::Item as Signal>::Item: FromReflect + SSs + Clone,
 {
     type Item = <Upstream::Item as Signal>::Item;
 
@@ -304,6 +297,7 @@ where
 ///
 /// Emits `true` if the upstream value is *not* equal to the provided `value`, `false` otherwise.
 /// Requires `Upstream::Item` to implement `PartialEq`.
+#[derive(Clone, Reflect)]
 pub struct Neq<Upstream>
 where
     Upstream: Signal,
@@ -327,11 +321,12 @@ where
 /// Represents a node that applies logical negation to a boolean signal. Implements [`Signal`].
 ///
 /// Requires `Upstream::Item` to implement `std::ops::Not`. Typically used with boolean signals.
+#[derive(Clone, Reflect)]
 pub struct Not<Upstream>
 where
     Upstream: Signal,
     <Upstream as Signal>::Item: std::ops::Not + FromReflect + SSs,
-    <<Upstream as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs,
+    <<Upstream as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs + Clone,
 {
     pub(crate) signal: Map<Upstream, <Upstream::Item as std::ops::Not>::Output>,
 }
@@ -340,7 +335,7 @@ impl<Upstream> Signal for Not<Upstream>
 where
     Upstream: Signal,
     <Upstream as Signal>::Item: std::ops::Not + FromReflect + SSs,
-    <<Upstream as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs,
+    <<Upstream as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs + Clone,
 {
     type Item = <Upstream::Item as std::ops::Not>::Output;
 
@@ -354,9 +349,11 @@ where
 /// This node takes a predicate system that receives the upstream value (`Upstream::Item`) via `In`
 /// and returns `bool`. The node only propagates the upstream value if the predicate returns `true`.
 /// If the predicate returns `false` or the system errors, propagation terminates.
+#[derive(Clone, Reflect)]
 pub struct Filter<Upstream> {
     pub(crate) upstream: Upstream,
-    pub(crate) signal: RegisterOnceSignal,
+    pub(crate) signal: LazySignal,
+    #[reflect(ignore)]
     _marker: PhantomData<bool>,
 }
 
@@ -367,7 +364,7 @@ where
 {
     type Item = Upstream::Item;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -381,12 +378,13 @@ where
 /// and must return another signal (`Switcher: Signal`). The `Switch` node then behaves like the
 /// returned signal until the `Upstream` emits a new value, causing the `switcher` to potentially
 /// return a different signal to switch to.
+#[derive(Clone, Reflect)]
 pub struct Switch<Upstream, Other>
 where
     Upstream: Signal,
     Upstream::Item: FromReflect + SSs,
     Other: Signal + FromReflect + SSs,
-    Other::Item: FromReflect + SSs,
+    Other::Item: FromReflect + SSs + Clone,
 {
     pub(crate) signal: Flatten<Map<Upstream, Other>>,
 }
@@ -396,7 +394,7 @@ where
     Upstream: Signal,
     Upstream::Item: FromReflect + SSs,
     Other: FromReflect + Signal,
-    Other::Item: FromReflect + SSs,
+    Other::Item: FromReflect + SSs + Clone,
 {
     type Item = Other::Item;
 
@@ -431,7 +429,7 @@ where
 
 pub struct MapBool<Upstream, O> {
     upstream: Upstream,
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     _marker: PhantomData<O>,
 }
 
@@ -443,7 +441,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -479,7 +477,7 @@ where
 /// Executes the provided system `t` only when the upstream signal emits `true`.
 pub struct MapTrue<Upstream, O> {
     upstream: Upstream,
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     _marker: PhantomData<O>,
 }
 
@@ -491,7 +489,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -503,7 +501,7 @@ where
 /// Executes the provided system `f` only when the upstream signal emits `false`.
 pub struct MapFalse<Upstream, O> {
     upstream: Upstream,
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     _marker: PhantomData<O>,
 }
 
@@ -515,7 +513,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -530,7 +528,7 @@ where
 /// Executes `none_system` if the upstream emits `None`, passing `()` via `In`.
 pub struct MapOption<Upstream, I, O> {
     upstream: Upstream,
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     _marker: PhantomData<(I, O)>,
 }
 
@@ -543,7 +541,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -555,7 +553,7 @@ where
 /// Executes the provided system `some_system` only when the upstream signal emits `Some(T)`, passing `T` via `In`.
 pub struct MapSome<Upstream, I, O> {
     upstream: Upstream,
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     _marker: PhantomData<(I, O)>,
 }
 
@@ -568,7 +566,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -580,7 +578,7 @@ where
 /// Executes the provided system `none_system` only when the upstream signal emits `None`, passing `()` via `In`.
 pub struct MapNone<Upstream, I, O> {
     upstream: Upstream,
-    signal: RegisterOnceSignal,
+    signal: LazySignal,
     _marker: PhantomData<(I, O)>,
 }
 
@@ -593,7 +591,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);
@@ -784,14 +782,14 @@ where
 {
     fn left_either<R>(self) -> SignalEither<Self, R>
     where
-        R: Signal + FromReflect + SSs
+        R: Signal + FromReflect + SSs,
     {
         SignalEither::Left(self)
     }
 
     fn right_either<L>(self) -> SignalEither<L, Self>
     where
-        L: Signal + FromReflect + SSs
+        L: Signal + FromReflect + SSs,
     {
         SignalEither::Right(self)
     }
@@ -824,7 +822,7 @@ pub trait SignalExt: Signal {
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
         F: IntoSystem<In<Self::Item>, IOO, M> + Send + Sync + 'static,
-        M: SSs
+        M: SSs,
     {
         Map {
             upstream: self,
@@ -854,7 +852,7 @@ pub trait SignalExt: Signal {
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
-        C: Component + Clone + FromReflect + SSs
+        C: Component + Clone + FromReflect + SSs,
     {
         MapComponent {
             signal: self.map(|In(entity): In<Entity>, components: Query<&C>| {
@@ -887,7 +885,7 @@ pub trait SignalExt: Signal {
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
-        C: Component + Clone + FromReflect + GetTypeRegistration + Typed + SSs
+        C: Component + Clone + FromReflect + GetTypeRegistration + Typed + SSs,
     {
         ComponentOption {
             signal: self.map(|In(entity): In<Entity>, components: Query<&C>| {
@@ -920,7 +918,7 @@ pub trait SignalExt: Signal {
     where
         Self: Sized,
         Self: Signal<Item = Entity>,
-        C: Component + Clone + FromReflect + SSs
+        C: Component + Clone + FromReflect + SSs,
     {
         HasComponent {
             signal: self
@@ -955,7 +953,7 @@ pub trait SignalExt: Signal {
     fn dedupe(self) -> Dedupe<Self>
     where
         Self: Sized,
-        Self::Item: PartialEq + Clone + FromReflect + SSs
+        Self::Item: PartialEq + Clone + FromReflect + SSs,
     {
         Dedupe {
             signal: self.map(
@@ -1005,7 +1003,7 @@ pub trait SignalExt: Signal {
     fn first(self) -> First<Self>
     where
         Self: Sized,
-        Self::Item: FromReflect + SSs
+        Self::Item: FromReflect + SSs,
     {
         First {
             signal: self.map(|In(item): In<Self::Item>, mut first: Local<bool>| {
@@ -1038,7 +1036,7 @@ pub trait SignalExt: Signal {
         Self: Sized, // Added Sized bound here
         Other: Signal,
         Self::Item: FromReflect + GetTypeRegistration + Typed + SSs,
-        Other::Item: FromReflect + GetTypeRegistration + Typed + SSs
+        Other::Item: FromReflect + GetTypeRegistration + Typed + SSs,
     {
         let left_wrapper = self.map(|In(left): In<Self::Item>| (Some(left), None::<Other::Item>));
         let right_wrapper =
@@ -1098,7 +1096,7 @@ pub trait SignalExt: Signal {
     where
         Self: Sized,
         Self::Item: FromReflect + Signal + Clone,
-        <Self::Item as Signal>::Item: FromReflect + SSs
+        <Self::Item as Signal>::Item: FromReflect + SSs + Clone,
     {
         // TODO: forward with observer instead of mutex ?
         let cur = Arc::new(Mutex::new(None));
@@ -1145,7 +1143,7 @@ pub trait SignalExt: Signal {
     fn eq(self, value: Self::Item) -> Eq<Self>
     where
         Self: Sized,
-        Self::Item: PartialEq + FromReflect + SSs
+        Self::Item: PartialEq + FromReflect + SSs,
     {
         Eq {
             signal: self.map(move |In(item): In<Self::Item>| item == value),
@@ -1168,7 +1166,7 @@ pub trait SignalExt: Signal {
     fn neq(self, value: Self::Item) -> Neq<Self>
     where
         Self: Sized,
-        Self::Item: PartialEq + FromReflect + SSs
+        Self::Item: PartialEq + FromReflect + SSs,
     {
         Neq {
             signal: self.map(move |In(item): In<Self::Item>| item != value),
@@ -1190,7 +1188,7 @@ pub trait SignalExt: Signal {
     where
         Self: Sized,
         <Self as Signal>::Item: std::ops::Not + FromReflect + SSs,
-        <<Self as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs
+        <<Self as Signal>::Item as std::ops::Not>::Output: FromReflect + SSs + Clone,
     {
         Not {
             signal: self.map(|In(item): In<Self::Item>| std::ops::Not::not(item)),
@@ -1226,9 +1224,9 @@ pub trait SignalExt: Signal {
     ) -> Filter<Self>
     where
         Self: Sized,
-        Self::Item: Clone + FromReflect + SSs
+        Self::Item: Clone + FromReflect + SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let system = world.register_system(predicate);
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
                 match world.run_system_with_input(system, item.clone()) {
@@ -1295,7 +1293,7 @@ pub trait SignalExt: Signal {
         S: Signal + Clone + FromReflect + SSs,
         S::Item: FromReflect + SSs + Clone,
         F: IntoSystem<In<Self::Item>, S, M> + Send + Sync + 'static,
-        M: SSs
+        M: SSs,
     {
         Switch {
             signal: self.map(switcher).flatten(),
@@ -1330,18 +1328,21 @@ pub trait SignalExt: Signal {
     fn throttle(self, duration: Duration) -> Throttle<Self>
     where
         Self: Sized,
-        Self::Item: FromReflect + SSs
+        Self::Item: FromReflect + SSs,
     {
         Throttle {
             signal: self.map(
-                move |In(item): In<Self::Item>, time: Res<Time>, mut timer_option: Local<Option<Timer>>| {
+                move |In(item): In<Self::Item>,
+                      time: Res<Time>,
+                      mut timer_option: Local<Option<Timer>>| {
                     match timer_option.as_mut() {
                         None => {
-                            *timer_option = Some(Timer::new(duration, TimerMode::Repeating));
+                            *timer_option = Some(Timer::new(duration, TimerMode::Once));
                             Some(item)
                         }
                         Some(timer) => {
                             if timer.tick(time.delta()).finished() {
+                                timer.reset();
                                 Some(item)
                             } else {
                                 None
@@ -1378,24 +1379,24 @@ pub trait SignalExt: Signal {
         TF: IntoSystem<In<()>, IOO, TM> + Send + Sync + 'static,
         FF: IntoSystem<In<()>, IOO, FM> + Send + Sync + 'static,
         TM: SSs,
-        FM: SSs
+        FM: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let true_system = world.register_system(true_system);
             let false_system = world.register_system(false_system);
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
-                world.run_system_with_input(
-                    if item {
-                        true_system
-                    } else {
-                        false_system
-                    },
-                    (),
-                ).ok().map(Into::into).flatten()
+                world
+                    .run_system_with_input(if item { true_system } else { false_system }, ())
+                    .ok()
+                    .map(Into::into)
+                    .flatten()
             };
             let signal = register_signal::<_, O, _, _, _>(world, wrapper_system);
             // just attach the system to the lifetime of the signal
-            world.entity_mut(*signal).add_child(true_system.entity()).add_child(false_system.entity());
+            world
+                .entity_mut(*signal)
+                .add_child(true_system.entity())
+                .add_child(false_system.entity());
             signal.into()
         });
         MapBool {
@@ -1431,13 +1432,17 @@ pub trait SignalExt: Signal {
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
         TF: IntoSystem<In<()>, IOO, TM> + Send + Sync + 'static,
-        TM: SSs
+        TM: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let true_system = world.register_system(system);
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
                 if item {
-                    world.run_system_with_input(true_system, ()).ok().map(Into::into).flatten()
+                    world
+                        .run_system_with_input(true_system, ())
+                        .ok()
+                        .map(Into::into)
+                        .flatten()
                 } else {
                     None
                 }
@@ -1480,13 +1485,17 @@ pub trait SignalExt: Signal {
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
         FF: IntoSystem<In<()>, IOO, FM> + Send + Sync + 'static,
-        FM: SSs
+        FM: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let false_system = world.register_system(system);
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
                 if !item {
-                    world.run_system_with_input(false_system, ()).ok().map(Into::into).flatten()
+                    world
+                        .run_system_with_input(false_system, ())
+                        .ok()
+                        .map(Into::into)
+                        .flatten()
                 } else {
                     None
                 }
@@ -1518,7 +1527,11 @@ pub trait SignalExt: Signal {
     ///     |_: In<()>| "None".to_string(),
     /// ); // Emits "Some(42)"
     /// ```
-    fn map_option<I, O, IOO, SF, NF, SM, NM>(self, some_system: SF, none_system: NF) -> MapOption<Self, I, O>
+    fn map_option<I, O, IOO, SF, NF, SM, NM>(
+        self,
+        some_system: SF,
+        none_system: NF,
+    ) -> MapOption<Self, I, O>
     where
         Self: Sized,
         Self: Signal<Item = Option<I>>,
@@ -1528,20 +1541,29 @@ pub trait SignalExt: Signal {
         SF: IntoSystem<In<I>, IOO, SM> + Send + Sync + 'static,
         NF: IntoSystem<In<()>, IOO, NM> + Send + Sync + 'static,
         SM: SSs,
-        NM: SSs
+        NM: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let some_system = world.register_system(some_system);
             let none_system = world.register_system(none_system);
-            let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| {
-                match item {
-                    Some(value) => world.run_system_with_input(some_system, value).ok().map(Into::into).flatten(),
-                    None => world.run_system_with_input(none_system, ()).ok().map(Into::into).flatten(),
-                }
+            let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| match item {
+                Some(value) => world
+                    .run_system_with_input(some_system, value)
+                    .ok()
+                    .map(Into::into)
+                    .flatten(),
+                None => world
+                    .run_system_with_input(none_system, ())
+                    .ok()
+                    .map(Into::into)
+                    .flatten(),
             };
             let signal = register_signal::<_, O, _, _, _>(world, wrapper_system);
             // just attach the system to the lifetime of the signal
-            world.entity_mut(*signal).add_child(some_system.entity()).add_child(none_system.entity());
+            world
+                .entity_mut(*signal)
+                .add_child(some_system.entity())
+                .add_child(none_system.entity());
             signal.into()
         });
         MapOption {
@@ -1573,15 +1595,17 @@ pub trait SignalExt: Signal {
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
         SF: IntoSystem<In<I>, IOO, SM> + Send + Sync + 'static,
-        SM: SSs
+        SM: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let some_system = world.register_system(system);
-            let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| {
-                match item {
-                    Some(value) => world.run_system_with_input(some_system, value).ok().map(Into::into).flatten(),
-                    None => None,
-                }
+            let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| match item {
+                Some(value) => world
+                    .run_system_with_input(some_system, value)
+                    .ok()
+                    .map(Into::into)
+                    .flatten(),
+                None => None,
             };
             let signal = register_signal::<_, O, _, _, _>(world, wrapper_system);
             // just attach the system to the lifetime of the signal
@@ -1617,15 +1641,17 @@ pub trait SignalExt: Signal {
         O: FromReflect + SSs,
         IOO: Into<Option<O>> + SSs,
         NF: IntoSystem<In<()>, IOO, NM> + Send + Sync + 'static,
-        NM: SSs
+        NM: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| {
+        let signal = LazySignal::new(move |world: &mut World| {
             let none_system = world.register_system(none_system);
-            let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| {
-                match item {
-                    Some(_) => None,
-                    None => world.run_system_with_input(none_system, ()).ok().map(Into::into).flatten(),
-                }
+            let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| match item {
+                Some(_) => None,
+                None => world
+                    .run_system_with_input(none_system, ())
+                    .ok()
+                    .map(Into::into)
+                    .flatten(),
             };
             let signal = register_signal::<_, O, _, _, _>(world, wrapper_system);
             // just attach the system to the lifetime of the signal
@@ -1658,7 +1684,7 @@ pub trait SignalExt: Signal {
     fn debug(self) -> SignalDebug<Self>
     where
         Self: Sized,
-        Self::Item: Debug + FromReflect + SSs
+        Self::Item: Debug + FromReflect + SSs,
     {
         let location = std::panic::Location::caller();
         SignalDebug {
@@ -1692,7 +1718,7 @@ pub trait SignalExt: Signal {
     /// the systems when the signal is no longer needed.
     fn register(self, world: &mut World) -> SignalHandle
     where
-        Self: Sized
+        Self: Sized,
     {
         self.register_signal(world)
     }
@@ -1913,30 +1939,24 @@ mod tests {
         let signal_1 = SignalBuilder::from_system(|_: In<()>| 1);
         let signal_2 = SignalBuilder::from_system(|_: In<()>| 2);
 
-        #[derive(Resource, Default, Reflect, Clone)]
-        #[reflect(Resource)]
-        struct SwitchSignal(bool);
-        app.init_resource::<SwitchSignal>();
+        #[derive(Resource, Default)]
+        struct SignalSelector(bool);
+        app.init_resource::<SignalSelector>();
 
-        let s1 = signal_1.map(|In(x)| x);
-        let signal = SignalBuilder::from_system(move |_: In<()>, selector: Res<SwitchSignal>| {
-            selector.0
-        })
-        .switch(clone!((s1, signal_2) move |In(use_1)| {
-            if use_1 {
-                s1.clone().left_either()
+        let signal = SignalBuilder::from_system(move |_: In<()>, selector: Res<SignalSelector>| {
+            if selector.0 {
+                signal_1.clone()
             } else {
-                signal_2.clone().right_either()
+                signal_2.clone()
             }
-        }))
+        })
+        .flatten()
         .map(capture_output)
         .register(app.world_mut());
-
         app.update();
         assert_eq!(get_output::<i32>(app.world()), Some(2));
 
-        app.world_mut().resource_mut::<SwitchSignal>().0 = true;
-        app.update();
+        app.world_mut().resource_mut::<SignalSelector>().0 = true;
         app.update();
         assert_eq!(get_output::<i32>(app.world()), Some(1));
 
@@ -2109,7 +2129,10 @@ mod tests {
         assert_eq!(*counter.lock().unwrap(), 1, "Source counter after initial");
 
         // 2. Advance time > duration (110ms).
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(110.)));
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(
+                110.,
+            )));
 
         // 3. Update again: Source emits 2. Time elapsed >= duration. Throttle emits 2.
         app.update();
@@ -2129,7 +2152,10 @@ mod tests {
             "Source counter after 110ms advance, 1st update"
         );
 
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(50)));
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                50,
+            )));
 
         // 6. Update again: Source emits 4. Time elapsed < duration since last emit. Throttle blocks. Output remains 2.
         app.update();
@@ -2149,7 +2175,8 @@ mod tests {
             "Source counter after 110ms advance, 2nd update"
         );
 
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(0)));
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(0)));
         // 7. Update again: Source emits 5. Time elapsed < duration since last emit. Throttle blocks. Output remains 2.
         app.update();
         assert_eq!(
@@ -2169,15 +2196,17 @@ mod tests {
         );
 
         // 8. Advance time > duration again (total 50 + 60 = 110ms since last emit at step 3).
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(60)));
-
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                60,
+            )));
 
         // 9. Update again: Source emits 5. Total time elapsed >= duration. Throttle emits 5.
         app.update();
         assert_eq!(
             get_output::<i32>(app.world()),
             Some(5), // Reverted: Expect 5 based on logic and actual output
-            "After 60ms advance, 1st update (emit 5)" // Corrected message to reflect expected value
+            "After 60ms advance, 1st update (emit 5)"  // Corrected message to reflect expected value
         );
         assert_eq!(
             *emit_count.lock().unwrap(),
@@ -2190,7 +2219,8 @@ mod tests {
             "Source counter after 60ms advance, 1st update"
         );
 
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(0)));
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(0)));
         // 10. Update again: Source emits 6. Time elapsed < duration since last emit. Throttle blocks. Output remains 5.
         app.update();
         assert_eq!(
@@ -2210,7 +2240,10 @@ mod tests {
         );
 
         // Add one more step to ensure timer reset correctly
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(110)));
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                110,
+            )));
         // 11. Update: Source emits 7. Time >= 100ms. Throttle emits 7.
         app.update();
         assert_eq!(
@@ -2229,7 +2262,8 @@ mod tests {
             "Source counter after 110ms advance, 1st update"
         );
 
-        app.world_mut().insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(0)));
+        app.world_mut()
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(0)));
         // 12. Update: Source emits 8. Time < 100ms. Throttle blocks. Output remains 7.
         app.update();
         assert_eq!(
@@ -2247,7 +2281,6 @@ mod tests {
             8, // Source counter is 8
             "Source counter after 110ms advance, 2nd update"
         );
-
 
         signal.cleanup(app.world_mut());
     }
@@ -2272,7 +2305,10 @@ mod tests {
             .map(capture_output)
             .register(app.world_mut());
         app.update();
-        assert_eq!(get_output::<&'static str>(app.world()), Some("False Branch"));
+        assert_eq!(
+            get_output::<&'static str>(app.world()),
+            Some("False Branch")
+        );
         signal_false.cleanup(app.world_mut());
     }
 
@@ -2291,7 +2327,9 @@ mod tests {
         signal_true.cleanup(app.world_mut());
 
         // Reset output
-        app.world_mut().resource_mut::<SignalOutput<&'static str>>().0 = None;
+        app.world_mut()
+            .resource_mut::<SignalOutput<&'static str>>()
+            .0 = None;
 
         // Test false case (should not emit)
         let signal_false = SignalBuilder::from_system(|_: In<()>| false)
@@ -2318,7 +2356,9 @@ mod tests {
         signal_true.cleanup(app.world_mut());
 
         // Reset output
-        app.world_mut().resource_mut::<SignalOutput<&'static str>>().0 = None;
+        app.world_mut()
+            .resource_mut::<SignalOutput<&'static str>>()
+            .0 = None;
 
         // Test false case (should emit)
         let signal_false = SignalBuilder::from_system(|_: In<()>| false)
@@ -2344,7 +2384,10 @@ mod tests {
             .map(capture_output)
             .register(app.world_mut());
         app.update();
-        assert_eq!(get_output::<String>(app.world()), Some("Some(42)".to_string()));
+        assert_eq!(
+            get_output::<String>(app.world()),
+            Some("Some(42)".to_string())
+        );
         signal_some.cleanup(app.world_mut());
 
         // Reset output
@@ -2374,7 +2417,10 @@ mod tests {
             .map(capture_output)
             .register(app.world_mut());
         app.update();
-        assert_eq!(get_output::<String>(app.world()), Some("Some(42)".to_string()));
+        assert_eq!(
+            get_output::<String>(app.world()),
+            Some("Some(42)".to_string())
+        );
         signal_some.cleanup(app.world_mut());
 
         // Reset output
@@ -2415,5 +2461,226 @@ mod tests {
         app.update();
         assert_eq!(get_output::<String>(app.world()), Some("None".to_string()));
         signal_none.cleanup(app.world_mut());
+    }
+
+    #[test]
+    fn simple_signal_lazy_outlives_handle() {
+        let mut app = create_test_app();
+
+        let source_signal_struct = SignalBuilder::from_system(|_: In<()>| 1);
+        let handle = source_signal_struct.clone().register(app.world_mut());
+        let system_entity = handle.0.entity();
+
+        assert!(
+            app.world().get_entity(system_entity).is_ok(),
+            "System entity should exist after registration"
+        );
+        assert!(
+            app.world().get::<LazySignalHolder>(system_entity).is_some(),
+            "LazySignalHolder should exist on system entity"
+        );
+        assert_eq!(
+            **app
+                .world()
+                .get::<SignalRegistrationCount>(system_entity)
+                .unwrap(),
+            1,
+            "SignalRegistrationCount should be 1"
+        );
+
+        handle.cleanup(app.world_mut());
+        assert_eq!(
+            **app
+                .world()
+                .get::<SignalRegistrationCount>(system_entity)
+                .unwrap(),
+            0,
+            "SignalRegistrationCount should be 0 after cleanup"
+        );
+        // LazySignalHolder is not removed because source_signal_struct (holding another LazySignal clone) still exists,
+        // so holder.lazy_signal.inner.references > 1 at the time of cleanup.
+        assert!(
+            app.world().get_entity(system_entity).is_ok(),
+            "System entity should still exist after handle cleanup (LazySignal struct alive)"
+        );
+        assert!(
+            app.world().get::<LazySignalHolder>(system_entity).is_some(),
+            "LazySignalHolder should still exist"
+        );
+
+        drop(source_signal_struct);
+        // Dropping source_signal_struct reduces LazySignalState.references.
+        // If it becomes 1 (only holder's copy left), LazySignal::drop doesn't queue.
+        // The system is not queued to CLEANUP_SIGNALS yet.
+        // LazySignalHolder is still present.
+        app.update(); // Runs flush_cleanup_signals. CLEANUP_SIGNALS is empty.
+        app.update(); // Runs flush_cleanup_signals. CLEANUP_SIGNALS is empty.
+
+        assert!(
+            app.world().get_entity(system_entity).is_err(),
+            "System entity persists because LazySignalHolder was not removed and its LazySignal did not trigger cleanup on its own drop"
+        );
+    }
+
+    // #[test]
+    // fn simple_signal_lazy_dropped_before_handle_cleanup() {
+    //     let mut app = create_test_app_for_cleanup();
+
+    //     let source_signal_struct = SignalBuilder::from_system(test_source_system);
+    //     let handle = source_signal_struct.clone().register(app.world_mut());
+    //     let system_entity = handle.0.entity();
+
+    //     assert!(app.world().get_entity(system_entity).is_some());
+    //     assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 1);
+
+    //     drop(source_signal_struct); // LazySignalState.references decreases.
+    //     app.update(); // CLEANUP_SIGNALS is empty. Entity still exists.
+
+    //     assert!(app.world().get_entity(system_entity).is_some());
+    //     assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+    //     handle.cleanup(app.world_mut());
+    //     // Now SignalRegistrationCount is 0.
+    //     // The LazySignal in LazySignalHolder is the only one left (references == 1).
+    //     // So, LazySignalHolder IS removed.
+    //     // Dropping LazySignalHolder drops its LazySignal, which queues the system_entity to CLEANUP_SIGNALS.
+    //     assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 0);
+    //     assert!(
+    //         app.world().get_entity(system_entity).is_some(),
+    //         "System entity exists before final flush"
+    //     );
+    //     assert!(
+    //         app.world().get::<LazySignalHolder>(system_entity).is_none(),
+    //         "LazySignalHolder should be removed"
+    //     );
+
+    //     app.update(); // Runs flush_cleanup_signals, processes CLEANUP_SIGNALS.
+    //     assert!(
+    //         app.world().get_entity(system_entity).is_none(),
+    //         "System entity should be despawned"
+    //     );
+    // }
+
+    #[test]
+    fn multiple_lazy_signal_clones_cleanup_behavior() {
+        let mut app = create_test_app();
+
+        let s1 = SignalBuilder::from_system(|_: In<()>| 1); // LS.state_refs = 1
+        let s2 = s1.clone(); // LS.state_refs = 2
+
+        let handle = s1.clone().register(app.world_mut()); // LS.state_refs = 3 (s1, s2, holder)
+        let system_entity = handle.0.entity();
+
+        assert!(app.world().get_entity(system_entity).is_ok());
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 1);
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        handle.cleanup(app.world_mut()); // RegCount = 0. LS.state_refs = 3 for holder check. Holder not removed.
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 0);
+        assert!(app.world().get_entity(system_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        drop(s1); // LS.state_refs = 2. Not queued.
+        app.update();
+        assert!(app.world().get_entity(system_entity).is_ok(), "Entity persists after s1 drop");
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        drop(s2); // LS.state_refs = 1 (only holder's copy). Not queued.
+        app.update();
+        assert!(app.world().get_entity(system_entity).is_err(), "Entity despawned after s2 drop, only holder left");
+    }
+
+    #[test]
+    fn multiple_handles_same_system() {
+        let mut app = create_test_app();
+
+        let source_signal_struct = SignalBuilder::from_system(|_: In<()>| 1); // LS.state_refs = 1
+
+        let handle1 = source_signal_struct.clone().register(app.world_mut()); // LS.state_refs = 2 (struct, holder). RegCount = 1.
+        let system_entity = handle1.0.entity();
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 1);
+
+        let handle2 = source_signal_struct.clone().register(app.world_mut()); // LS.state_refs = 2 (no new holder). RegCount = 2.
+        assert_eq!(system_entity, handle2.0.entity());
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 2);
+
+        handle1.cleanup(app.world_mut()); // RegCount = 1. Holder not removed (LS.state_refs=2).
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 1);
+        assert!(app.world().get_entity(system_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        drop(source_signal_struct); // LS.state_refs = 1 (holder only). Not queued.
+        app.update();
+        assert!(app.world().get_entity(system_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+        
+        handle2.cleanup(app.world_mut()); // RegCount = 0. LS.state_refs = 1 for holder. Holder IS removed. Queued.
+        app.update();
+        assert!(app.world().get_entity(system_entity).is_err());
+    }
+
+    #[test]
+    fn chained_signals_cleanup() {
+        let mut app = create_test_app();
+
+        let source_s = SignalBuilder::from_system(|_: In<()>| 1);
+        let map_s = source_s.map(|In(val)| val + 1); // map_s holds source_s
+
+        let handle = map_s.clone().register(app.world_mut());
+        let map_entity = handle.0.entity();
+        let source_entity = app.world().get::<Upstream>(map_entity).unwrap().iter().next().unwrap().entity();
+
+        assert!(app.world().get_entity(map_entity).is_ok());
+        assert!(app.world().get_entity(source_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(map_entity).is_some());
+        assert!(app.world().get::<LazySignalHolder>(source_entity).is_some());
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(map_entity).unwrap(), 1);
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(source_entity).unwrap(), 1);
+
+        handle.cleanup(app.world_mut());
+        // map_entity: RegCount=0. Holder's LS refs > 1 (due to map_s). Holder not removed.
+        // source_entity: RegCount=0. Holder's LS refs > 1 (due to map_s.source_s). Holder not removed.
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(map_entity).unwrap(), 0);
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(source_entity).unwrap(), 0);
+        assert!(app.world().get_entity(map_entity).is_ok());
+        assert!(app.world().get_entity(source_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(map_entity).is_some());
+        assert!(app.world().get::<LazySignalHolder>(source_entity).is_some());
+
+        drop(map_s); // Drops map_s's LazySignal, then source_s's LazySignal.
+                     // For both, their LS.state_refs becomes 1 (holder only). queued.
+        app.update();
+        // Both entities despawned.
+        assert!(app.world().get_entity(map_entity).is_err(), "Map entity persists");
+        assert!(app.world().get_entity(source_entity).is_err(), "Source entity persists");
+    }
+
+    #[test]
+    fn re_register_after_cleanup_while_lazy_alive() {
+        let mut app = create_test_app();
+
+        let source_signal_struct = SignalBuilder::from_system(|_: In<()>| 1); // LS.state_refs = 1
+
+        let handle1 = source_signal_struct.clone().register(app.world_mut()); // LS.state_refs = 2 (struct, holder). RegCount = 1.
+        let system_entity = handle1.0.entity();
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 1);
+
+        handle1.cleanup(app.world_mut()); // RegCount = 0. Holder not removed (LS.state_refs=2).
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 0);
+        assert!(app.world().get_entity(system_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        let handle2 = source_signal_struct.clone().register(app.world_mut()); // RegCount becomes 1 again on same entity. LS.state_refs=2.
+        assert_eq!(system_entity, handle2.0.entity());
+        assert_eq!(**app.world().get::<SignalRegistrationCount>(system_entity).unwrap(), 1);
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        drop(source_signal_struct); // LS.state_refs = 1 (holder only). Not queued.
+        app.update();
+        assert!(app.world().get_entity(system_entity).is_ok());
+        assert!(app.world().get::<LazySignalHolder>(system_entity).is_some());
+
+        handle2.cleanup(app.world_mut()); // RegCount = 0. Holder's LS.state_refs = 1. Holder IS removed. despawned.
+        assert!(app.world().get_entity(system_entity).is_err());
     }
 }

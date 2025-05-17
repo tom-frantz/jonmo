@@ -4,9 +4,10 @@ use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::ComponentId, prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId, SystemState}, world::DeferredWorld
 };
+use bevy_hierarchy::DespawnRecursiveExt;
 use bevy_reflect::{FromReflect, PartialReflect, Reflect};
 use bevy_log::prelude::*;
-use std::{collections::{HashSet, VecDeque}, hash::Hash, sync::{Arc, LazyLock, Mutex}};
+use std::{collections::{HashSet, VecDeque}, hash::Hash, sync::{atomic::{AtomicUsize, Ordering}, Arc, LazyLock, Mutex, RwLock}};
 
 #[derive(Clone, Copy, Deref, Debug, PartialEq, Eq, Hash, Reflect)]
 pub struct SignalSystem(pub Entity);
@@ -24,8 +25,8 @@ impl SignalSystem {
     }
 }
 
-/// Component storing metadata for signal system nodes, primarily for reference counting.
-#[derive(Component)]
+// /// Component storing metadata for signal system nodes, primarily for reference counting.
+#[derive(Component, Deref)]
 pub(crate) struct SignalRegistrationCount(i32);
 
 impl SignalRegistrationCount {
@@ -38,9 +39,8 @@ impl SignalRegistrationCount {
         self.0 += 1;
     }
 
-    pub(crate) fn decrement(&mut self) -> i32 {
+    pub(crate) fn decrement(&mut self) {
         self.0 -= 1;
-        self.0
     }
 }
 
@@ -279,7 +279,12 @@ where
 
 
 /// Internal enum used by `RegisterOnceSignal` to track registration state.
-pub(crate) enum RegisterOnceSignalInternal {
+pub(crate) struct LazySignalState {
+    references: AtomicUsize,
+    system: RwLock<LazySystem>,
+}
+
+enum LazySystem {
     System(Option<Box<dyn FnOnce(&mut World) -> SignalSystem + Send + Sync + 'static>>),
     Registered(SignalSystem),
 }
@@ -290,36 +295,50 @@ pub(crate) enum RegisterOnceSignalInternal {
 /// if the system has already been registered. If not, it runs the provided closure
 /// to create and register the system. If it has, it increments the registration count
 /// for the existing system.
-#[derive(Clone, Reflect)]
+#[derive(Reflect)]
 #[reflect(opaque)]
-pub(crate) struct RegisterOnceSignal {
-    inner: Arc<Mutex<RegisterOnceSignalInternal>>,
+pub(crate) struct LazySignal {
+    inner: Arc<LazySignalState>,
 }
 
-impl RegisterOnceSignal {
+#[derive(Component)]
+pub(crate) struct LazySignalHolder(LazySignal);
+
+impl LazySignal {
     /// Creates a new `RegisterOnceSignal` that will register the system only once.
     /// The system is provided as a closure that takes a mutable reference to the `World`.
     pub fn new<F: FnOnce(&mut World) -> SignalSystem + Send + Sync + 'static>(system: F) -> Self {
-        RegisterOnceSignal {
-            inner: Arc::new(Mutex::new(RegisterOnceSignalInternal::System(Some(
-                Box::new(system),
-            )))),
+        LazySignal {
+            inner: Arc::new(LazySignalState {
+                references: AtomicUsize::new(1),
+                system: RwLock::new(LazySystem::System(Some(Box::new(system)))),
+            }),
         }
+    }
+
+    pub fn register(self, world: &mut World) -> SignalSystem {
+        let signal = self.inner.system.write().unwrap().register(world);
+        if let Ok(mut entity) = world.get_entity_mut(*signal) {
+            if !entity.contains::<LazySignalHolder>() {
+                entity.insert(LazySignalHolder(self));
+            }
+        }
+        signal
     }
 }
 
-impl RegisterOnceSignal {
+impl LazySystem {
     /// Registers the system if it hasn't been registered yet.
     /// Returns the system ID of the registered system.
     pub fn register(&mut self, world: &mut World) -> SignalSystem {
-        let mut guard = self.inner.lock().unwrap();
-        match &mut *guard {
-            RegisterOnceSignalInternal::System(f) => {
+        // let mut guard = self.inner.lock().unwrap();
+        match self {
+            LazySystem::System(f) => {
                 let signal = f.take().unwrap()(world).into();
-                *guard = RegisterOnceSignalInternal::Registered(signal);
+                *self = LazySystem::Registered(signal);
                 signal
             }
-            RegisterOnceSignalInternal::Registered(signal) => {
+            LazySystem::Registered(signal) => {
                 if let Ok(mut system) = world.get_entity_mut(**signal) {
                     if let Some(mut registration_count) =
                         system.get_mut::<SignalRegistrationCount>()
@@ -337,24 +356,40 @@ impl RegisterOnceSignal {
 pub(crate) static CLEANUP_SIGNALS: LazyLock<Mutex<Vec<SignalSystem>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-impl Drop for RegisterOnceSignal {
+impl Clone for LazySignal {
+    fn clone(&self) -> Self {
+        self.inner.references.fetch_add(1, Ordering::SeqCst);
+        LazySignal {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for LazySignal {
     fn drop(&mut self) {
-        if let RegisterOnceSignalInternal::Registered(signal) = &*self.inner.lock().unwrap() {
-            CLEANUP_SIGNALS.lock().unwrap().push(*signal);
+        // <= 2 because we wna queue if only the holder remains
+        if self.inner.references.fetch_sub(1, Ordering::SeqCst) <= 2 {
+            if let LazySystem::Registered(signal)  = *self.inner.system.read().unwrap() {
+                CLEANUP_SIGNALS.lock().unwrap().push(signal);
+            }
         }
     }
 }
 
 pub(crate) fn flush_cleanup_signals(world: &mut World) {
-    let mut signals = CLEANUP_SIGNALS.lock().unwrap();
-    for signal in signals.drain(..) {
-        if world.get_entity_mut(*signal).is_ok() {
-            // entity.try_despawn_recursive();
+    let signals = CLEANUP_SIGNALS.lock().unwrap().drain(..).collect::<Vec<_>>();
+    for signal in signals {
+        if let Ok(entity) = world.get_entity_mut(*signal) {
+            if let Some(registration_count) = entity.get::<SignalRegistrationCount>() {
+                if **registration_count == 0 {
+                    entity.try_despawn_recursive();
+                }
+            }
         }
     }
 }
 
-pub(crate) fn register_once_signal_from_system<I, O, IOO, F, M>(system: F) -> RegisterOnceSignal
+pub(crate) fn register_once_signal_from_system<I, O, IOO, F, M>(system: F) -> LazySignal
 where
     I: FromReflect + SSs,
     O: FromReflect + SSs,
@@ -362,7 +397,7 @@ where
     F: IntoSystem<In<I>, IOO, M> + SSs,
     M: SSs,
 {
-    RegisterOnceSignal::new(move |world: &mut World| spawn_signal(world, system))
+    LazySignal::new(move |world: &mut World| spawn_signal(world, system))
 }
 
 /// An iterator that traverses *upstream* signal dependencies.
@@ -470,10 +505,20 @@ pub(crate) fn signal_handle_cleanup_helper(
             signal_handle_cleanup_helper(world, upstreams.0);
         }
         if let Ok(mut entity) = world.get_entity_mut(*signal) {
+            let mut no_registrations = false;
             if let Some(mut registration_count) = entity.get_mut::<SignalRegistrationCount>() {
-                if registration_count.decrement() == 0 {
+                registration_count.decrement();
+                if **registration_count == 0 {
                     entity.remove::<Upstream>();
                     entity.remove::<Downstream>();
+                    no_registrations = true;
+                }
+            }
+            if no_registrations {
+                if let Some(LazySignalHolder(lazy_signal)) = entity.get::<LazySignalHolder>() {
+                    if lazy_signal.inner.references.load(Ordering::SeqCst) == 1 {
+                        entity.try_despawn_recursive();
+                    }
                 }
             }
         }

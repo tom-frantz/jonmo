@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    tree::{SignalSystem, pipe_signal, register_signal, SignalHandle, RegisterOnceSignal, register_once_signal_from_system},
+    tree::{SignalSystem, pipe_signal, register_signal, SignalHandle, LazySignal, register_once_signal_from_system},
     utils::SSs,
 };
 // Removed unused RunSystemOnce import
@@ -205,7 +205,7 @@ where
     U: Reflect + FromReflect + GetTypeRegistration + Typed + SSs,
 {
     pub(crate) upstream: Upstream,
-    pub(crate) signal: RegisterOnceSignal,
+    pub(crate) signal: LazySignal,
     _marker: PhantomData<U>,
 }
 
@@ -216,7 +216,7 @@ where
     Upstream::Item: Reflect + FromReflect + GetTypeRegistration + Typed + SSs,
 {
     pub(crate) upstream: Upstream,
-    pub(crate) signal: RegisterOnceSignal,
+    pub(crate) signal: LazySignal,
 }
 
 impl<Upstream> Clone for ForEachVec<Upstream>
@@ -337,7 +337,7 @@ where
         F: IntoSystem<In<T::Item>, O, M> + Send + Sync + 'static,
         M: SSs,
     {
-        let signal = RegisterOnceSignal::new(move |world: &mut World| -> SignalSystem {
+        let signal = LazySignal::new(move |world: &mut World| -> SignalSystem {
             let system = world.register_system(system);
             let wrapper_system = move |In(diff_batch): In<Vec<VecDiff<T::Item>>>,
                                        world: &mut World|
