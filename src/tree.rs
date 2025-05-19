@@ -4,10 +4,16 @@ use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::ComponentId, prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId, SystemState}, world::DeferredWorld
 };
-use bevy_hierarchy::DespawnRecursiveExt;
-use bevy_reflect::{FromReflect, PartialReflect, Reflect};
 use bevy_log::prelude::*;
-use std::{collections::{HashSet, VecDeque}, hash::Hash, sync::{atomic::{AtomicUsize, Ordering}, Arc, LazyLock, Mutex, RwLock}};
+use bevy_reflect::{FromReflect, PartialReflect, Reflect};
+use std::{
+    collections::{HashSet, VecDeque},
+    hash::Hash,
+    sync::{
+        Arc, LazyLock, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[derive(Clone, Copy, Deref, Debug, PartialEq, Eq, Hash, Reflect)]
 pub struct SignalSystem(pub Entity);
