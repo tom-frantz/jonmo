@@ -80,7 +80,7 @@ fn downstream_syncer(mut world: DeferredWorld, HookContext { entity, .. }: HookC
                         if let Ok(mut downstreams) = downstreams.get_mut(*upstream_system) {
                             downstreams.0.remove(&SignalSystem(entity));
                             if downstreams.0.is_empty() {
-                                if let Some(mut entity) = commands.get_entity(*upstream_system) {
+                                if let Ok(mut entity) = commands.get_entity(*upstream_system) {
                                     entity.remove::<Downstream>();
                                 }
                             }
@@ -219,7 +219,6 @@ pub(crate) fn process_signals(world: &mut World) {
 #[derive(Clone, Deref, DerefMut)]
 pub struct SignalHandle(pub SignalSystem);
 
-
 impl SignalHandle {
     /// Creates a new SignalHandle.
     /// This is crate-public to allow construction from other modules.
@@ -286,7 +285,6 @@ where
     ));
     system.into()
 }
-
 
 /// Internal enum used by `RegisterOnceSignal` to track registration state.
 pub(crate) struct LazySignalState {
@@ -379,7 +377,7 @@ impl Drop for LazySignal {
     fn drop(&mut self) {
         // <= 2 because we wna queue if only the holder remains
         if self.inner.references.fetch_sub(1, Ordering::SeqCst) <= 2 {
-            if let LazySystem::Registered(signal)  = *self.inner.system.read().unwrap() {
+            if let LazySystem::Registered(signal) = *self.inner.system.read().unwrap() {
                 CLEANUP_SIGNALS.lock().unwrap().push(signal);
             }
         }
@@ -387,7 +385,11 @@ impl Drop for LazySignal {
 }
 
 pub(crate) fn flush_cleanup_signals(world: &mut World) {
-    let signals = CLEANUP_SIGNALS.lock().unwrap().drain(..).collect::<Vec<_>>();
+    let signals = CLEANUP_SIGNALS
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect::<Vec<_>>();
     for signal in signals {
         if let Ok(entity) = world.get_entity_mut(*signal) {
             if let Some(registration_count) = entity.get::<SignalRegistrationCount>() {
