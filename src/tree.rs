@@ -3,7 +3,10 @@ use crate::utils::SSs;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::component::HookContext;
 use bevy_ecs::{
-    prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId, SystemState}, world::DeferredWorld
+    prelude::*,
+    query::{QueryData, QueryFilter},
+    system::{RunSystemOnce, SystemId, SystemState},
+    world::DeferredWorld,
 };
 use bevy_log::prelude::*;
 use bevy_reflect::{FromReflect, PartialReflect, Reflect};
@@ -413,7 +416,7 @@ where
 /// and indirect upstream dependencies (systems that provide input to it).
 pub(crate) struct UpstreamIter<'w, 's, D: QueryData, F: QueryFilter>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Upstream>,
 {
     upstreams_query: &'w Query<'w, 's, D, F>,
     upstreams: VecDeque<SignalSystem>,
@@ -421,7 +424,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> UpstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Upstream>,
 {
     /// Returns a new [`DescendantIter`].
     pub fn new(upstreams_query: &'w Query<'w, 's, D, F>, signal: SignalSystem) -> Self {
@@ -439,7 +442,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for UpstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Upstream>,
 {
     type Item = SignalSystem;
 
@@ -461,7 +464,7 @@ where
 #[allow(dead_code)] // Currently unused within the crate, but potentially useful
 pub(crate) struct DownstreamIter<'w, 's, D: QueryData, F: QueryFilter>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Downstream>,
 {
     downstreams_query: &'w Query<'w, 's, D, F>,
     downstreams: VecDeque<SignalSystem>,
@@ -469,7 +472,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> DownstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Downstream>,
 {
     /// Returns a new [`DescendantIter`].
     #[allow(dead_code)] // Currently unused within the crate
@@ -488,7 +491,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for DownstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Downstream>,
 {
     type Item = SignalSystem;
 
