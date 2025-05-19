@@ -164,7 +164,7 @@ impl JonmoBuilder {
     {
         self.signal_from_entity(move |signal| {
             f(
-                signal.map(move |In(entity): In<Entity>, parents: Query<&Parent>| {
+                signal.map(move |In(entity): In<Entity>, parents: Query<&ChildOf>| {
                     parents
                         .iter_ancestors(entity)
                         .nth(generations.saturating_sub(1))
