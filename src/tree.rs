@@ -389,7 +389,7 @@ pub(crate) fn flush_cleanup_signals(world: &mut World) {
         if let Ok(entity) = world.get_entity_mut(*signal) {
             if let Some(registration_count) = entity.get::<SignalRegistrationCount>() {
                 if **registration_count == 0 {
-                    entity.try_despawn_recursive();
+                    entity.despawn();
                 }
             }
         }
@@ -524,7 +524,7 @@ pub(crate) fn signal_handle_cleanup_helper(
             if no_registrations {
                 if let Some(LazySignalHolder(lazy_signal)) = entity.get::<LazySignalHolder>() {
                     if lazy_signal.inner.references.load(Ordering::SeqCst) == 1 {
-                        entity.try_despawn_recursive();
+                        entity.despawn();
                     }
                 }
             }
