@@ -22,7 +22,7 @@ enclose = "1.2"
 
 [dev-dependencies]
 bevy = "0.15.3"
-rand = "0.8"
+rand = "0.9"
 
 [[example]]
 name = "basic"
