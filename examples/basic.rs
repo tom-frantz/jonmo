@@ -20,6 +20,7 @@ struct Value(i32);
 fn ui(world: &mut World) {
     let text = world.spawn((Node::default(), Value(0))).id();
     let signal = SignalBuilder::from_component(text)
+        .dedupe()
         .map(move |In(value): In<Value>, mut commands: Commands| {
             commands.entity(text).insert(Text(value.0.to_string()));
         })

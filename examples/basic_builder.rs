@@ -9,7 +9,7 @@ fn main() {
             Startup,
             (
                 |world: &mut World| {
-                    ui_root().spawn(world);
+                    ui().spawn(world);
                 },
                 camera,
             ),
@@ -25,7 +25,7 @@ struct ValueTicker(Timer);
 #[derive(Component, Reflect, Clone, Default, PartialEq)]
 struct Value(i32);
 
-fn ui_root() -> JonmoBuilder {
+fn ui() -> JonmoBuilder {
     JonmoBuilder::from(Node {
         justify_content: JustifyContent::Center,
         align_items: AlignItems::Center,
@@ -37,7 +37,7 @@ fn ui_root() -> JonmoBuilder {
         JonmoBuilder::from(Node::default())
             .insert(Value(0))
             .component_signal_from_component(|signal| {
-                signal.map(|In(value): In<Value>| Some(Text(value.0.to_string())))
+                signal.dedupe().map(|In(value): In<Value>| Some(Text(value.0.to_string())))
             }),
     )
 }

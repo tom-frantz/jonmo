@@ -2,14 +2,14 @@ use crate::{tree::*, utils::*};
 use bevy_ecs::prelude::*;
 use bevy_hierarchy::prelude::*;
 use bevy_log::prelude::*;
-use bevy_reflect::{FromReflect, GetTypeRegistration, PartialReflect, Reflect, Typed};
-use bevy_time::{Time, Timer, TimerMode}; // Use Timer and TimerMode for throttle
+use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
+use bevy_time::{Time, Timer, TimerMode};
 use std::{
     fmt::Debug,
     marker::PhantomData,
     sync::{Arc, Mutex},
-    time::Duration, // Add Duration import
-}; // Add import
+    time::Duration,
+};
 
 /// Represents a value that changes over time and handles internal registration logic.
 ///
@@ -76,7 +76,7 @@ where
 {
     type Item = O;
 
-    fn register_signal(mut self, world: &mut World) -> SignalHandle {
+    fn register_signal(self, world: &mut World) -> SignalHandle {
         let SignalHandle(upstream) = self.upstream.register(world);
         let signal = self.signal.register(world);
         pipe_signal(world, upstream, signal);

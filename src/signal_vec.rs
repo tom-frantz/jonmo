@@ -1,24 +1,17 @@
 use bevy_ecs::prelude::*;
 use bevy_hierarchy::BuildChildren;
-// Removed unused system::SystemId
-use bevy_reflect::{FromReflect, GetTypeRegistration, Typed, prelude::*}; // Add reflection traits
+use bevy_reflect::{FromReflect, GetTypeRegistration, Typed, prelude::*};
 use std::{
     fmt,
     marker::PhantomData,
     ops::Deref,
-    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}, // Added RwLock and guards
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use crate::{
     tree::{SignalSystem, pipe_signal, register_signal, SignalHandle, LazySignal, register_once_signal_from_system},
     utils::SSs,
 };
-// Removed unused RunSystemOnce import
-// Removed unused crate::identity import
-
-//-------------------------------------------------------------------------------------------------
-// VecDiff - Based on futures-signals VecDiff
-//-------------------------------------------------------------------------------------------------
 
 /// Describes the changes to a `Vec`.
 ///
@@ -107,7 +100,6 @@ where
     }
 }
 
-// Manual Clone implementation as derive(Clone) requires T: Clone
 impl<T> Clone for VecDiff<T>
 where
     T: Clone + Reflect + FromReflect + GetTypeRegistration + Typed + SSs, // Removed PartialEq
@@ -143,18 +135,6 @@ where
         }
     }
 }
-
-//-------------------------------------------------------------------------------------------------
-// Source System Logic (Reverted)
-//-------------------------------------------------------------------------------------------------
-
-// Removed SignalVecSourceState component
-// Removed SignalVecDirtyFlag component
-// Removed state_emitter_system function
-
-// Removed unused identity_batch_system function
-
-// --- Consolidated SignalVec Trait ---
 
 /// Represents a `Vec` that changes over time, yielding [`VecDiff<T>`] and handling registration.
 ///
