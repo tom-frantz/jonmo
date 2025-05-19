@@ -1228,7 +1228,7 @@ pub trait SignalExt: Signal {
         let signal = LazySignal::new(move |world: &mut World| {
             let system = world.register_system(predicate);
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
-                match world.run_system_with_input(system, item.clone()) {
+                match world.run_system_with(system, item.clone()) {
                     Ok(true) => Some(item),
                     Ok(false) | Err(_) => None, // terminate on false or error
                 }
@@ -1385,7 +1385,7 @@ pub trait SignalExt: Signal {
             let false_system = world.register_system(false_system);
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
                 world
-                    .run_system_with_input(if item { true_system } else { false_system }, ())
+                    .run_system_with(if item { true_system } else { false_system }, ())
                     .ok()
                     .map(Into::into)
                     .flatten()
@@ -1438,7 +1438,7 @@ pub trait SignalExt: Signal {
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
                 if item {
                     world
-                        .run_system_with_input(true_system, ())
+                        .run_system_with(true_system, ())
                         .ok()
                         .map(Into::into)
                         .flatten()
@@ -1491,7 +1491,7 @@ pub trait SignalExt: Signal {
             let wrapper_system = move |In(item): In<Self::Item>, world: &mut World| {
                 if !item {
                     world
-                        .run_system_with_input(false_system, ())
+                        .run_system_with(false_system, ())
                         .ok()
                         .map(Into::into)
                         .flatten()
@@ -1547,12 +1547,12 @@ pub trait SignalExt: Signal {
             let none_system = world.register_system(none_system);
             let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| match item {
                 Some(value) => world
-                    .run_system_with_input(some_system, value)
+                    .run_system_with(some_system, value)
                     .ok()
                     .map(Into::into)
                     .flatten(),
                 None => world
-                    .run_system_with_input(none_system, ())
+                    .run_system_with(none_system, ())
                     .ok()
                     .map(Into::into)
                     .flatten(),
@@ -1600,7 +1600,7 @@ pub trait SignalExt: Signal {
             let some_system = world.register_system(system);
             let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| match item {
                 Some(value) => world
-                    .run_system_with_input(some_system, value)
+                    .run_system_with(some_system, value)
                     .ok()
                     .map(Into::into)
                     .flatten(),
@@ -1647,7 +1647,7 @@ pub trait SignalExt: Signal {
             let wrapper_system = move |In(item): In<Option<I>>, world: &mut World| match item {
                 Some(_) => None,
                 None => world
-                    .run_system_with_input(none_system, ())
+                    .run_system_with(none_system, ())
                     .ok()
                     .map(Into::into)
                     .flatten(),

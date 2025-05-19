@@ -8,7 +8,10 @@ use std::{
 };
 
 use crate::{
-    tree::{SignalSystem, pipe_signal, register_signal, SignalHandle, LazySignal, register_once_signal_from_system},
+    tree::{
+        LazySignal, SignalHandle, SignalSystem, pipe_signal, register_once_signal_from_system,
+        register_signal,
+    },
     utils::SSs,
 };
 
@@ -328,28 +331,28 @@ where
                         VecDiff::Replace { values } => {
                             let mapped_values: Vec<O> = values
                                 .into_iter()
-                                .filter_map(|v| world.run_system_with_input(system, v).ok())
+                                    .filter_map(|v| world.run_system_with(system, v).ok())
                                 .collect();
                             Some(VecDiff::Replace {
                                 values: mapped_values,
                             })
                         }
                         VecDiff::InsertAt { index, value } => world
-                            .run_system_with_input(system, value)
+                                .run_system_with(system, value)
                             .ok()
                             .map(|mapped_value| VecDiff::InsertAt {
                                 index,
                                 value: mapped_value,
                             }),
                         VecDiff::UpdateAt { index, value } => world
-                            .run_system_with_input(system, value)
+                                .run_system_with(system, value)
                             .ok()
                             .map(|mapped_value| VecDiff::UpdateAt {
                                 index,
                                 value: mapped_value,
                             }),
                         VecDiff::Push { value } => world
-                            .run_system_with_input(system, value)
+                                .run_system_with(system, value)
                             .ok()
                             .map(|mapped_value| VecDiff::Push {
                                 value: mapped_value,

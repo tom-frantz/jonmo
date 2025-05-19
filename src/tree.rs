@@ -258,7 +258,7 @@ where
         SystemRunner {
             runner: Arc::new(Box::new(move |world, input| {
                 match I::from_reflect(input.as_ref()) {
-                    Some(input) => match world.run_system_with_input(system, input) {
+                    Some(input) => match world.run_system_with(system, input) {
                         Ok(output) => {
                             if let Some(output) = Into::<Option<O>>::into(output) {
                                 Some(Box::new(output) as Box<dyn PartialReflect>)
