@@ -7,7 +7,6 @@ use crate::{
     utils::{LazyEntity, SSs},
 };
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
-use bevy_hierarchy::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
 use std::sync::{Arc, Mutex};
 

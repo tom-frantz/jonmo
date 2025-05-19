@@ -1,6 +1,5 @@
 use crate::{tree::*, utils::*};
 use bevy_ecs::prelude::*;
-use bevy_hierarchy::prelude::*;
 use bevy_log::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
 use bevy_time::{Time, Timer, TimerMode};
