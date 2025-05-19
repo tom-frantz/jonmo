@@ -1,8 +1,9 @@
 use crate::utils::SSs;
 
 use bevy_derive::{Deref, DerefMut};
+use bevy_ecs::component::HookContext;
 use bevy_ecs::{
-    component::ComponentId, prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId, SystemState}, world::DeferredWorld
+    prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId, SystemState}, world::DeferredWorld
 };
 use bevy_log::prelude::*;
 use bevy_reflect::{FromReflect, PartialReflect, Reflect};
@@ -65,7 +66,7 @@ where
     register_once_signal_from_system(system).register(world)
 }
 
-fn downstream_syncer(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+fn downstream_syncer(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
     world.commands().queue(move |world: &mut World| {
         let _ = world.run_system_once(
             move |upstreams: Query<&Upstream>,

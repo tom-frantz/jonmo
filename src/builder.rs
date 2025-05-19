@@ -6,11 +6,12 @@ use crate::{
     tree::SignalHandle,
     utils::{LazyEntity, SSs},
 };
+use bevy_ecs::component::HookContext;
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
 use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
 use std::sync::{Arc, Mutex};
 
-fn cleanup_signal_handles(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+fn cleanup_signal_handles(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
     if let Some(handles) = world.get_entity_mut(entity).ok().and_then(|mut entity| {
         entity
             .get_mut::<SignalHandles>()
