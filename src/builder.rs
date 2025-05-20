@@ -6,12 +6,12 @@ use crate::{
     tree::SignalHandle,
     utils::{LazyEntity, SSs},
 };
+use bevy_ecs::component::HookContext;
 use bevy_ecs::{component::ComponentId, prelude::*, world::DeferredWorld};
-use bevy_hierarchy::prelude::*;
 use bevy_reflect::{FromReflect, GetTypeRegistration, Reflect, Typed};
 use std::sync::{Arc, Mutex};
 
-fn cleanup_signal_handles(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+fn cleanup_signal_handles(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
     if let Some(handles) = world.get_entity_mut(entity).ok().and_then(|mut entity| {
         entity
             .get_mut::<SignalHandles>()
@@ -164,7 +164,7 @@ impl JonmoBuilder {
     {
         self.signal_from_entity(move |signal| {
             f(
-                signal.map(move |In(entity): In<Entity>, parents: Query<&Parent>| {
+                signal.map(move |In(entity): In<Entity>, parents: Query<&ChildOf>| {
                     parents
                         .iter_ancestors(entity)
                         .nth(generations.saturating_sub(1))

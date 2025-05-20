@@ -11,18 +11,17 @@ repository = "https://github.com/databasedav/jonmo"
 documentation = "https://docs.rs/jonmo"
 
 [dependencies]
-bevy_ecs = "0.15.3"
-bevy_reflect = "0.15.3"
-bevy_hierarchy = "0.15.3"
-bevy_log = "0.15.3"
-bevy_app = "0.15.3"
-bevy_derive = "0.15.3"
-bevy_time = "0.15.3"
+bevy_ecs = "0.16.0"
+bevy_reflect = "0.16.0"
+bevy_log = "0.16.0"
+bevy_app = "0.16.0"
+bevy_derive = "0.16.0"
+bevy_time = "0.16.0"
 enclose = "1.2"
 
 [dev-dependencies]
-bevy = "0.15.3"
-rand = "0.8"
+bevy = "0.16.0"
+rand = "0.9"
 
 [[example]]
 name = "basic"

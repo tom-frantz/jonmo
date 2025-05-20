@@ -1,13 +1,23 @@
 use crate::utils::SSs;
 
 use bevy_derive::{Deref, DerefMut};
+use bevy_ecs::component::HookContext;
 use bevy_ecs::{
-    component::ComponentId, prelude::*, query::{QueryData, QueryFilter, WorldQuery}, system::{RunSystemOnce, SystemId, SystemState}, world::DeferredWorld
+    prelude::*,
+    query::{QueryData, QueryFilter},
+    system::{RunSystemOnce, SystemId, SystemState},
+    world::DeferredWorld,
 };
-use bevy_hierarchy::DespawnRecursiveExt;
-use bevy_reflect::{FromReflect, PartialReflect, Reflect};
 use bevy_log::prelude::*;
-use std::{collections::{HashSet, VecDeque}, hash::Hash, sync::{atomic::{AtomicUsize, Ordering}, Arc, LazyLock, Mutex, RwLock}};
+use bevy_reflect::{FromReflect, PartialReflect, Reflect};
+use std::{
+    collections::{HashSet, VecDeque},
+    hash::Hash,
+    sync::{
+        Arc, LazyLock, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[derive(Clone, Copy, Deref, Debug, PartialEq, Eq, Hash, Reflect)]
 pub struct SignalSystem(pub Entity);
@@ -59,7 +69,7 @@ where
     register_once_signal_from_system(system).register(world)
 }
 
-fn downstream_syncer(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
+fn downstream_syncer(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
     world.commands().queue(move |world: &mut World| {
         let _ = world.run_system_once(
             move |upstreams: Query<&Upstream>,
@@ -70,7 +80,7 @@ fn downstream_syncer(mut world: DeferredWorld, entity: Entity, _: ComponentId) {
                         if let Ok(mut downstreams) = downstreams.get_mut(*upstream_system) {
                             downstreams.0.remove(&SignalSystem(entity));
                             if downstreams.0.is_empty() {
-                                if let Some(mut entity) = commands.get_entity(*upstream_system) {
+                                if let Ok(mut entity) = commands.get_entity(*upstream_system) {
                                     entity.remove::<Downstream>();
                                 }
                             }
@@ -209,7 +219,6 @@ pub(crate) fn process_signals(world: &mut World) {
 #[derive(Clone, Deref, DerefMut)]
 pub struct SignalHandle(pub SignalSystem);
 
-
 impl SignalHandle {
     /// Creates a new SignalHandle.
     /// This is crate-public to allow construction from other modules.
@@ -248,7 +257,7 @@ where
         SystemRunner {
             runner: Arc::new(Box::new(move |world, input| {
                 match I::from_reflect(input.as_ref()) {
-                    Some(input) => match world.run_system_with_input(system, input) {
+                    Some(input) => match world.run_system_with(system, input) {
                         Ok(output) => {
                             if let Some(output) = Into::<Option<O>>::into(output) {
                                 Some(Box::new(output) as Box<dyn PartialReflect>)
@@ -276,7 +285,6 @@ where
     ));
     system.into()
 }
-
 
 /// Internal enum used by `RegisterOnceSignal` to track registration state.
 pub(crate) struct LazySignalState {
@@ -369,7 +377,7 @@ impl Drop for LazySignal {
     fn drop(&mut self) {
         // <= 2 because we wna queue if only the holder remains
         if self.inner.references.fetch_sub(1, Ordering::SeqCst) <= 2 {
-            if let LazySystem::Registered(signal)  = *self.inner.system.read().unwrap() {
+            if let LazySystem::Registered(signal) = *self.inner.system.read().unwrap() {
                 CLEANUP_SIGNALS.lock().unwrap().push(signal);
             }
         }
@@ -377,12 +385,16 @@ impl Drop for LazySignal {
 }
 
 pub(crate) fn flush_cleanup_signals(world: &mut World) {
-    let signals = CLEANUP_SIGNALS.lock().unwrap().drain(..).collect::<Vec<_>>();
+    let signals = CLEANUP_SIGNALS
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect::<Vec<_>>();
     for signal in signals {
         if let Ok(entity) = world.get_entity_mut(*signal) {
             if let Some(registration_count) = entity.get::<SignalRegistrationCount>() {
                 if **registration_count == 0 {
-                    entity.try_despawn_recursive();
+                    entity.despawn();
                 }
             }
         }
@@ -406,7 +418,7 @@ where
 /// and indirect upstream dependencies (systems that provide input to it).
 pub(crate) struct UpstreamIter<'w, 's, D: QueryData, F: QueryFilter>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Upstream>,
 {
     upstreams_query: &'w Query<'w, 's, D, F>,
     upstreams: VecDeque<SignalSystem>,
@@ -414,7 +426,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> UpstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Upstream>,
 {
     /// Returns a new [`DescendantIter`].
     pub fn new(upstreams_query: &'w Query<'w, 's, D, F>, signal: SignalSystem) -> Self {
@@ -432,7 +444,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for UpstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Upstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Upstream>,
 {
     type Item = SignalSystem;
 
@@ -454,7 +466,7 @@ where
 #[allow(dead_code)] // Currently unused within the crate, but potentially useful
 pub(crate) struct DownstreamIter<'w, 's, D: QueryData, F: QueryFilter>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Downstream>,
 {
     downstreams_query: &'w Query<'w, 's, D, F>,
     downstreams: VecDeque<SignalSystem>,
@@ -462,7 +474,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> DownstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Downstream>,
 {
     /// Returns a new [`DescendantIter`].
     #[allow(dead_code)] // Currently unused within the crate
@@ -481,7 +493,7 @@ where
 
 impl<'w, 's, D: QueryData, F: QueryFilter> Iterator for DownstreamIter<'w, 's, D, F>
 where
-    D::ReadOnly: WorldQuery<Item<'w> = &'w Downstream>,
+    D::ReadOnly: QueryData<Item<'w> = &'w Downstream>,
 {
     type Item = SignalSystem;
 
@@ -517,7 +529,7 @@ pub(crate) fn signal_handle_cleanup_helper(
             if no_registrations {
                 if let Some(LazySignalHolder(lazy_signal)) = entity.get::<LazySignalHolder>() {
                     if lazy_signal.inner.references.load(Ordering::SeqCst) == 1 {
-                        entity.try_despawn_recursive();
+                        entity.despawn();
                     }
                 }
             }

@@ -1,6 +1,6 @@
 use bevy::color::palettes::css::*;
 use bevy::prelude::*;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 
 pub(crate) static COLORS: &[Color] = &[
     bevy::prelude::Color::Srgba(ALICE_BLUE),
@@ -138,6 +138,6 @@ pub(crate) static COLORS: &[Color] = &[
 ];
 
 pub(crate) fn random_color() -> Color {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     COLORS.choose(&mut rng).copied().unwrap()
 }
