@@ -186,7 +186,7 @@ pub(crate) fn process_signals_helper(
             .ok()
             .and_then(|entity| entity.get::<SystemRunner>().cloned())
         {
-            if let Some(output) = runner.run(world, input.clone_value()) {
+            if let Some(output) = runner.run(world, input.to_dynamic()) {
                 if let Some(downstream) = world.get::<Downstream>(*signal).map(clone_downstream) {
                     process_signals_helper(world, downstream, output);
                 }
